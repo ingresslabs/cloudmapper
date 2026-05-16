@@ -20,7 +20,7 @@ Useful local targets:
 
 - `make build` builds the CLI.
 - `make test` runs unit tests.
-- `make check` runs formatting, type checking, and tests.
+- `make check` runs formatting, type checking, tests, and a debug build.
 - `make ui DB=infra/infra.sqlite` serves the local Cytoscape UI.
 - `make clean` removes Cargo build output.
 
@@ -182,6 +182,22 @@ mapping, relationships, and compare findings. Critical and high findings are
 overlaid directly on graph nodes, and the side panels provide service filters,
 Terraform-managed filtering, finding navigation, blast radius, and recommended
 actions.
+
+## Errors
+
+CLI failures are printed as a compact block on stderr:
+
+```text
+cloudmapper error: AWS credentials are expired
+context: calling sts:GetCallerIdentity
+hint: refresh AWS credentials and retry; for AWS SSO run `aws sso login`, or pass `--profile <name>` for a valid profile
+details:
+  - failed to refresh cached Login token: Your session has expired. Please reauthenticate.
+  - AccessDeniedException: The refresh token has expired.
+```
+
+Noisy AWS SDK warning chains are suppressed by default so the actionable
+message stays visible.
 
 ## Verification
 

@@ -24,6 +24,7 @@ fmt:
 check: fmt
 	$(CARGO_ENV) cargo check
 	$(CARGO_ENV) cargo test
+	$(CARGO_ENV) cargo build
 
 build:
 	$(CARGO_ENV) cargo build

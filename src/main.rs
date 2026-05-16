@@ -8,7 +8,7 @@ mod writer;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use clap::{Parser, ValueEnum};
 use tracing_subscriber::FmtSubscriber;
 
@@ -148,14 +148,25 @@ enum ServiceSet {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    init_logging();
+
+    if let Err(error) = run().await {
+        eprintln!("{}", format_cli_error(&error));
+        std::process::exit(1);
+    }
+}
+
+fn init_logging() {
     let subscriber = FmtSubscriber::builder()
         .with_target(false)
-        .with_max_level(tracing::Level::WARN)
+        .with_max_level(tracing::Level::ERROR)
         .without_time()
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
 
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Scan(args) => {
@@ -226,4 +237,134 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn format_cli_error(error: &Error) -> String {
+    let chain = error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>();
+    let text = chain.join("\n").to_lowercase();
+    let context = operation_context(&chain);
+    let classification = classify_error(&text);
+
+    let mut lines = Vec::new();
+    lines.push(format!("cloudmapper error: {}", classification.summary));
+    if let Some(context) = context.as_ref() {
+        lines.push(format!("context: {context}"));
+    }
+    lines.push(format!("hint: {}", classification.hint));
+
+    let details = dedup_details(&chain)
+        .into_iter()
+        .filter(|detail| Some(detail) != context.as_ref())
+        .collect::<Vec<_>>();
+    if !details.is_empty() {
+        lines.push("details:".to_string());
+        for detail in details.into_iter().take(4) {
+            lines.push(format!("  - {detail}"));
+        }
+    }
+
+    lines.join("\n")
+}
+
+struct ErrorClassification {
+    summary: &'static str,
+    hint: &'static str,
+}
+
+fn classify_error(text: &str) -> ErrorClassification {
+    if text.contains("refresh token has expired")
+        || text.contains("session has expired")
+        || text.contains("failed to refresh cached login token")
+    {
+        return ErrorClassification {
+            summary: "AWS credentials are expired",
+            hint: "refresh AWS credentials and retry; for AWS SSO run `aws sso login`, or pass `--profile <name>` for a valid profile",
+        };
+    }
+
+    if text.contains("no credentials") || text.contains("failed to load credentials") {
+        return ErrorClassification {
+            summary: "AWS credentials are not available",
+            hint: "configure AWS credentials, set AWS_PROFILE, or pass `--profile <name>`",
+        };
+    }
+
+    if text.contains("accessdenied") || text.contains("access denied") {
+        return ErrorClassification {
+            summary: "AWS API access was denied",
+            hint: "check the selected AWS profile and IAM permissions for the requested scan",
+        };
+    }
+
+    ErrorClassification {
+        summary: "command failed",
+        hint: "rerun with a valid input path, database, or AWS profile depending on the command context",
+    }
+}
+
+fn operation_context(chain: &[String]) -> Option<String> {
+    chain
+        .iter()
+        .find(|cause| {
+            cause.starts_with("calling ")
+                || cause.starts_with("opening ")
+                || cause.starts_with("reading ")
+                || cause.starts_with("parsing ")
+                || cause.starts_with("binding ")
+                || cause.starts_with("loading ")
+        })
+        .cloned()
+}
+
+fn dedup_details(chain: &[String]) -> Vec<String> {
+    let mut details = Vec::new();
+    for cause in chain {
+        if is_low_signal_detail(cause) || details.contains(cause) {
+            continue;
+        }
+        details.push(cause.clone());
+    }
+    details
+}
+
+fn is_low_signal_detail(cause: &str) -> bool {
+    matches!(
+        cause,
+        "dispatch failure" | "other" | "an error occurred while loading credentials"
+    ) || cause.starts_with("AccessDeniedException: AccessDeniedException")
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::format_cli_error;
+
+    #[test]
+    fn formats_expired_aws_credentials_as_actionable_error() {
+        let error = anyhow!("AccessDeniedException: The refresh token has expired.")
+            .context("failed to refresh cached Login token: Your session has expired.")
+            .context("calling sts:GetCallerIdentity");
+
+        let formatted = format_cli_error(&error);
+
+        assert!(formatted.contains("cloudmapper error: AWS credentials are expired"));
+        assert!(formatted.contains("context: calling sts:GetCallerIdentity"));
+        assert!(formatted.contains("aws sso login"));
+        assert!(!formatted.contains("Caused by:"));
+    }
+
+    #[test]
+    fn formats_generic_errors_with_context_and_details() {
+        let error = anyhow!("missing file").context("reading Terraform state terraform.tfstate");
+
+        let formatted = format_cli_error(&error);
+
+        assert!(formatted.contains("cloudmapper error: command failed"));
+        assert!(formatted.contains("context: reading Terraform state terraform.tfstate"));
+        assert!(formatted.contains("details:"));
+    }
 }
