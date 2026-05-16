@@ -1218,6 +1218,7 @@ mod tests {
         assert!(INDEX_HTML.contains("data-theme=\"light\""));
         assert!(INDEX_HTML.contains("class=\"graph-header\""));
         assert!(INDEX_HTML.contains("data-view=\"mission\""));
+        assert!(INDEX_HTML.contains("data-view=\"cost\""));
         assert!(INDEX_HTML.contains("/xterm.css"));
         assert!(INDEX_HTML.contains("/xterm.js"));
         assert!(INDEX_HTML.contains("icon-spread"));
@@ -1227,11 +1228,14 @@ mod tests {
         assert!(INDEX_HTML.contains("icon-cost"));
         assert!(APP_CSS.contains("#spread.active"));
         assert!(APP_CSS.contains(".cost-row.active"));
+        assert!(APP_CSS.contains(".cost-analytics-grid"));
         assert!(APP_CSS.contains(".mission-terminal"));
         assert!(APP_CSS.contains(".workspace.hide-inspector"));
         assert!(APP_CSS.contains(".workspace.hide-findings"));
         assert!(APP_JS.contains("function spreadGraph()"));
         assert!(APP_JS.contains("function setCostMode"));
+        assert!(APP_JS.contains("function renderCostAnalytics()"));
+        assert!(APP_JS.contains("COST_BASIS"));
         assert!(APP_JS.contains("function renderMissionTerminal()"));
         assert!(APP_JS.contains("function toggleSpreadMode()"));
         assert!(APP_JS.contains("function togglePanel(panel)"));
@@ -1241,6 +1245,7 @@ mod tests {
         assert!(APP_JS.contains("params.set(\"inspector\", \"0\")"));
         assert!(APP_JS.contains("params.set(\"findingsPanel\", \"0\")"));
         assert!(APP_JS.contains("params.set(\"cost\", state.costMode)"));
+        assert!(APP_JS.contains("params.set(\"costBasis\", state.costAnalytics.basis)"));
         assert!(APP_JS.contains("Spread graph"));
         assert!(APP_JS.contains("Compact graph"));
     }

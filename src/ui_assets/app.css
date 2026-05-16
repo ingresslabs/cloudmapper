@@ -524,6 +524,10 @@ select {
   color: var(--managed);
 }
 
+.view-button.active[data-view="cost"] {
+  color: var(--cost-high);
+}
+
 .view-button.active[data-view="attack"] {
   color: var(--critical);
 }
@@ -979,6 +983,174 @@ select {
   width: 100%;
   height: 100%;
   display: block;
+}
+
+.cost-view-header {
+  flex-wrap: wrap;
+}
+
+.cost-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.cost-control span {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.cost-control select {
+  height: 30px;
+  min-width: 116px;
+}
+
+.cost-analytics-grid {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(360px, 1.2fr) minmax(320px, 0.8fr);
+  grid-template-rows: auto minmax(260px, 1fr) minmax(230px, 0.78fr);
+  gap: 10px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.cost-panel {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--float-bg);
+  overflow: hidden;
+}
+
+.cost-summary-panel {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  overflow: visible;
+}
+
+.cost-panel-treemap {
+  grid-row: span 2;
+}
+
+.cost-summary-card {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--float-bg);
+  padding: 10px;
+}
+
+.cost-summary-card span,
+.cost-summary-card small,
+.cost-panel-head small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cost-summary-card strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cost-panel-head {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--line);
+  padding: 9px 10px;
+}
+
+.cost-panel-head span {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cost-d3-stage {
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  padding: 8px;
+}
+
+.cost-treemap-cell,
+.cost-bar,
+.cost-scatter-point {
+  cursor: pointer;
+}
+
+.cost-treemap-cell rect,
+.cost-bar rect,
+.cost-delta-bar rect {
+  transition: opacity 160ms ease, stroke 160ms ease;
+}
+
+.cost-treemap-cell:hover rect,
+.cost-bar:hover rect,
+.cost-scatter-point:hover {
+  opacity: 1;
+  stroke: var(--focus);
+  stroke-width: 1.6;
+}
+
+.cost-treemap-title,
+.cost-treemap-value,
+.cost-bar-label,
+.cost-bar-value,
+.cost-scatter-label,
+.cost-axis-note {
+  font-size: 11px;
+  font-weight: 750;
+  pointer-events: none;
+}
+
+.cost-treemap-title,
+.cost-treemap-value,
+.cost-bar-value {
+  fill: #ffffff;
+}
+
+.cost-bar-label,
+.cost-scatter-label,
+.cost-axis-note {
+  fill: var(--muted);
+}
+
+.cost-scatter-grid,
+.cost-zero-line {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.cost-scatter-point {
+  opacity: 0.82;
+  stroke-width: 1.3;
 }
 
 .atlas-axis-label {
@@ -1776,6 +1948,15 @@ select {
     grid-template-rows: minmax(270px, auto) minmax(280px, 1fr);
   }
 
+  .cost-analytics-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto repeat(4, minmax(260px, auto));
+  }
+
+  .cost-panel-treemap {
+    grid-row: auto;
+  }
+
   .inspector {
     border-top: 1px solid var(--line);
     border-right: 0;
@@ -1824,6 +2005,15 @@ select {
     flex-direction: column;
     gap: 5px;
     margin-right: 0;
+  }
+
+  .cost-summary-panel {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .cost-control,
+  .cost-control select {
+    width: 100%;
   }
 
   .mission-split {

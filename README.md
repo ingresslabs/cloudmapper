@@ -136,6 +136,12 @@ Costed nodes get a blue ring and scale by monthly cost. The inspector shows both
 hourly, daily, and monthly values so list-price estimates and billed Cost
 Explorer allocations can be compared on the same resource.
 
+The D3 Cost Analytics view turns the same node costs into a FinOps dashboard.
+Use it to switch between estimated, actual, and delta sources; compare hour,
+day, and month run rates; group spend by service, environment, application,
+owner, or region; and inspect treemap, top-resource, cost-vs-risk, and
+estimated-vs-actual charts without leaving the local UI.
+
 ## Usage
 
 Scan AWS:
@@ -426,9 +432,9 @@ archives plus SHA-256 checksum files to the GitHub release.
 Use annotated SemVer tags:
 
 ```bash
-git tag -a v0.1.1 -m "cloudmapper v0.1.1"
+git tag -a v0.1.2 -m "cloudmapper v0.1.2"
 git push origin main
-git push origin v0.1.1
+git push origin v0.1.2
 ```
 
 Do not move published tags. If a release tag is wrong, create the next patch tag.
