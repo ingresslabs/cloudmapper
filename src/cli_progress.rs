@@ -9,7 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const PIPELINE: &str = "cloud -> facts -> map.db";
+const DISPLAY_DELAY: Duration = Duration::from_millis(1200);
+const FRAME_INTERVAL: Duration = Duration::from_millis(90);
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 const STAGES: &[&str] = &[
     "discovering cloud state",
@@ -77,15 +79,6 @@ impl IngestAnimation {
 
     pub fn fail(mut self) {
         self.stop_thread();
-        if self.enabled {
-            let _ = writeln!(
-                io::stderr(),
-                "\r\x1b[2Kfailed {} -> {} after {}",
-                self.label,
-                self.db_path.display(),
-                elapsed(self.started_at)
-            );
-        }
         self.enabled = false;
     }
 
@@ -109,6 +102,10 @@ impl Drop for IngestAnimation {
 
 fn animate(stop: Arc<AtomicBool>, stage: Arc<Mutex<String>>, label: String, color: bool) {
     let started_at = Instant::now();
+    if !wait_for_display_delay(&stop, started_at) {
+        return;
+    }
+
     let mut tick = 0usize;
     while !stop.load(Ordering::Relaxed) {
         let frame = FRAMES[tick % FRAMES.len()];
@@ -123,10 +120,20 @@ fn animate(stop: Arc<AtomicBool>, stage: Arc<Mutex<String>>, label: String, colo
         );
         let _ = io::stderr().flush();
         tick = tick.wrapping_add(1);
-        thread::sleep(Duration::from_millis(90));
+        thread::sleep(FRAME_INTERVAL);
     }
     let _ = write!(io::stderr(), "\r\x1b[2K");
     let _ = io::stderr().flush();
+}
+
+fn wait_for_display_delay(stop: &AtomicBool, started_at: Instant) -> bool {
+    while started_at.elapsed() < DISPLAY_DELAY {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        thread::sleep(STOP_POLL_INTERVAL);
+    }
+    !stop.load(Ordering::Relaxed)
 }
 
 fn should_animate() -> bool {
@@ -139,10 +146,10 @@ fn color_enabled() -> bool {
 
 fn render_line(frame: &str, label: &str, stage: &str, elapsed: String, color: bool) -> String {
     if !color {
-        return format!("{frame} cloudmapper ingest  {label}  {stage}  {PIPELINE}  {elapsed}");
+        return format!("{frame} {label}: {stage} {elapsed}");
     }
     format!(
-        "\x1b[36m{frame}\x1b[0m \x1b[1mcloudmapper ingest\x1b[0m  {label}  \x1b[2m{stage}\x1b[0m  \x1b[2m{PIPELINE}\x1b[0m  \x1b[2m{elapsed}\x1b[0m"
+        "\x1b[36m{frame}\x1b[0m \x1b[1m{label}\x1b[0m: \x1b[2m{stage}\x1b[0m \x1b[2m{elapsed}\x1b[0m"
     )
 }
 
@@ -153,5 +160,25 @@ fn elapsed(started_at: Instant) -> String {
         format!("{}m{:02}s", seconds / 60, seconds % 60)
     } else {
         format!("{seconds}.{:01}s", elapsed.subsec_millis() / 100)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_line;
+
+    #[test]
+    fn renders_short_plain_progress_line() {
+        let line = render_line(
+            ">",
+            "aws",
+            "discovering AWS resources",
+            "1.2s".to_string(),
+            false,
+        );
+
+        assert_eq!(line, "> aws: discovering AWS resources 1.2s");
+        assert!(!line.contains("cloudmapper ingest"));
+        assert!(!line.contains("map.db"));
     }
 }
