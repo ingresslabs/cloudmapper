@@ -706,7 +706,7 @@ fn classify_error(text: &str) -> ErrorClassification {
     {
         return ErrorClassification {
             summary: "AWS credentials are expired",
-            hint: "refresh AWS credentials and retry; for AWS SSO run `aws sso login`, or pass `--profile <name>` for a valid profile",
+            hint: "for SSO, run `aws sso login --profile <name>` for the same profile\n      if SSO config is missing, run `aws configure sso --profile <name>` first",
             show_details: false,
         };
     }
@@ -801,7 +801,8 @@ mod tests {
 
         assert!(formatted.contains("cloudmapper error: AWS credentials are expired"));
         assert!(formatted.contains("context: calling sts:GetCallerIdentity"));
-        assert!(formatted.contains("aws sso login"));
+        assert!(formatted.contains("aws sso login --profile <name>"));
+        assert!(formatted.contains("aws configure sso --profile <name>"));
         assert!(!formatted.contains("details:"));
         assert!(!formatted.contains("Caused by:"));
     }
@@ -820,7 +821,7 @@ mod tests {
 
         assert_eq!(
             formatted,
-            "cloudmapper error: AWS credentials are expired\ncontext: calling sts:GetCallerIdentity\nhint: refresh AWS credentials and retry; for AWS SSO run `aws sso login`, or pass `--profile <name>` for a valid profile"
+            "cloudmapper error: AWS credentials are expired\ncontext: calling sts:GetCallerIdentity\nhint: for SSO, run `aws sso login --profile <name>` for the same profile\n      if SSO config is missing, run `aws configure sso --profile <name>` first"
         );
     }
 
