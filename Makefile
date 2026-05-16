@@ -4,7 +4,7 @@ CARGO_ENV ?= CARGO_PROFILE_DEV_DEBUG=0 CARGO_BUILD_JOBS=1
 DB ?= infra/infra.sqlite
 BIND ?= 127.0.0.1:8765
 
-.PHONY: help fmt check build buld test ui clean
+.PHONY: help fmt check build buld test ui loc clean
 
 help:
 	@printf 'cloudmapper Make targets\n\n'
@@ -13,6 +13,7 @@ help:
 	@printf '  make check       Run fmt, check, and tests\n'
 	@printf '  make fmt         Check Rust formatting\n'
 	@printf '  make ui          Serve the local Cytoscape UI\n'
+	@printf '  make loc         Count lines in source files\n'
 	@printf '  make clean       Remove Cargo build output\n\n'
 	@printf 'Options:\n'
 	@printf '  DB=%s\n' '$(DB)'
@@ -36,6 +37,16 @@ test:
 
 ui:
 	$(CARGO_ENV) cargo run -- ui --db "$(DB)" --bind "$(BIND)"
+
+loc:
+	@git ls-files -z -- \
+		Makefile \
+		Cargo.toml \
+		'src/*.rs' \
+		'src/ui_assets/*.html' \
+		'src/ui_assets/*.css' \
+		'src/ui_assets/*.js' \
+		| xargs -0 wc -l
 
 clean:
 	cargo clean

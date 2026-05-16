@@ -22,6 +22,7 @@ Useful local targets:
 - `make test` runs unit tests.
 - `make check` runs formatting, type checking, tests, and a debug build.
 - `make ui DB=infra/infra.sqlite` serves the local Cytoscape UI.
+- `make loc` counts lines in source files.
 - `make clean` removes Cargo build output.
 
 ## Usage
