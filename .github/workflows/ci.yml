@@ -22,7 +22,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
@@ -32,6 +32,9 @@ jobs:
 
       - name: Check
         run: cargo check --locked
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --locked

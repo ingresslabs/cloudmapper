@@ -83,9 +83,7 @@ pub fn compare_infra(
     };
     let mut report = compare_connection(&connection, &scan_id, &terraform_state_id)?;
     write_findings(&connection, &report)?;
-    report
-        .findings
-        .sort_by(|left, right| finding_sort_key(left).cmp(&finding_sort_key(right)));
+    report.findings.sort_by_key(finding_sort_key);
     Ok(report)
 }
 

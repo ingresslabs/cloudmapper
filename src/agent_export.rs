@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::db::{latest_terraform_state_id, open_cloudmapper_db};
 
@@ -17,11 +17,23 @@ pub struct AgentExport {
     pub generated_at: String,
     pub scan: AgentScan,
     pub counts: AgentCounts,
+    pub redaction: AgentRedaction,
     pub resources: Vec<AgentResource>,
     pub relationships: Vec<AgentRelationship>,
     pub terraform: AgentTerraform,
     pub findings: Vec<AgentFinding>,
     pub graph: AgentGraph,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AgentExportOptions {
+    pub include_sensitive: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentRedaction {
+    pub mode: String,
+    pub redacted_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -189,6 +201,7 @@ pub fn export_agent_bundle(
     scan_id: Option<&str>,
     terraform_state_id: Option<&str>,
     compare_run_id: Option<&str>,
+    options: AgentExportOptions,
 ) -> Result<AgentExport> {
     let connection = open_cloudmapper_db(db_path)?;
     let scan_id = match scan_id {
@@ -205,11 +218,17 @@ pub fn export_agent_bundle(
     };
 
     let scan = load_scan(&connection, &scan_id)?;
-    let terraform = load_terraform(&connection, terraform_state_id.as_deref())?;
+    let terraform = load_terraform(&connection, terraform_state_id.as_deref(), options)?;
     let terraform_by_uid = terraform_by_uid(&terraform.resource_instances);
     let findings = load_findings(&connection, compare_run_id.as_deref())?;
     let findings_by_uid = findings_by_uid(&findings);
-    let resources = load_resources(&connection, &scan_id, &terraform_by_uid, &findings_by_uid)?;
+    let resources = load_resources(
+        &connection,
+        &scan_id,
+        &terraform_by_uid,
+        &findings_by_uid,
+        options,
+    )?;
     let relationships = load_relationships(&connection, &scan_id)?;
     let graph = agent_graph(&resources, &relationships);
 
@@ -223,6 +242,7 @@ pub fn export_agent_bundle(
             findings: findings.len(),
             scan_errors: scan.errors.len(),
         },
+        redaction: redaction(options),
         scan,
         resources,
         relationships,
@@ -315,6 +335,7 @@ fn load_resources(
     scan_id: &str,
     terraform_by_uid: &BTreeMap<String, Vec<String>>,
     findings_by_uid: &BTreeMap<String, ResourceFindings>,
+    options: AgentExportOptions,
 ) -> Result<Vec<AgentResource>> {
     let mut statement = connection.prepare(
         r#"
@@ -345,9 +366,17 @@ fn load_resources(
             arn: row.get(8)?,
             name: row.get(9)?,
             tags: parse_json(row.get::<_, String>(10)?)?,
-            attributes: parse_json(row.get::<_, String>(11)?)?,
+            attributes: if options.include_sensitive {
+                parse_json(row.get::<_, String>(11)?)?
+            } else {
+                json!({})
+            },
             evidence: parse_json(row.get::<_, String>(12)?)?,
-            raw: parse_optional_json(row.get::<_, Option<String>>(13)?)?,
+            raw: if options.include_sensitive {
+                parse_optional_json(row.get::<_, Option<String>>(13)?)?
+            } else {
+                None
+            },
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
@@ -377,7 +406,11 @@ fn load_relationships(connection: &Connection, scan_id: &str) -> Result<Vec<Agen
         .context("loading relationships")
 }
 
-fn load_terraform(connection: &Connection, state_id: Option<&str>) -> Result<AgentTerraform> {
+fn load_terraform(
+    connection: &Connection,
+    state_id: Option<&str>,
+    options: AgentExportOptions,
+) -> Result<AgentTerraform> {
     let Some(state_id) = state_id else {
         return Ok(AgentTerraform {
             state: None,
@@ -394,9 +427,10 @@ fn load_terraform(connection: &Connection, state_id: Option<&str>) -> Result<Age
             "#,
             params![state_id],
             |row| {
+                let source_path: String = row.get(0)?;
                 Ok(AgentTerraformState {
                     state_id: state_id.to_string(),
-                    source_path: row.get(0)?,
+                    source_path: export_source_path(&source_path, options),
                     terraform_version: row.get(1)?,
                     serial: row.get(2)?,
                     lineage: row.get(3)?,
@@ -427,8 +461,16 @@ fn load_terraform(connection: &Connection, state_id: Option<&str>) -> Result<Age
             provider: row.get(5)?,
             index_key: parse_optional_json(row.get::<_, Option<String>>(6)?)?,
             schema_version: row.get(7)?,
-            attributes: parse_json(row.get::<_, String>(8)?)?,
-            sensitive_attributes: parse_json(row.get::<_, String>(9)?)?,
+            attributes: if options.include_sensitive {
+                parse_json(row.get::<_, String>(8)?)?
+            } else {
+                json!({})
+            },
+            sensitive_attributes: if options.include_sensitive {
+                parse_json(row.get::<_, String>(9)?)?
+            } else {
+                json!([])
+            },
             dependencies: parse_json(row.get::<_, String>(10)?)?,
             aws_uid: row.get(11)?,
         })
@@ -524,6 +566,37 @@ fn terraform_by_uid(
     map
 }
 
+fn redaction(options: AgentExportOptions) -> AgentRedaction {
+    if options.include_sensitive {
+        return AgentRedaction {
+            mode: "include_sensitive".to_string(),
+            redacted_fields: Vec::new(),
+        };
+    }
+
+    AgentRedaction {
+        mode: "redacted".to_string(),
+        redacted_fields: vec![
+            "resources.attributes".to_string(),
+            "resources.raw".to_string(),
+            "terraform.state.source_path".to_string(),
+            "terraform.resource_instances.attributes".to_string(),
+            "terraform.resource_instances.sensitive_attributes".to_string(),
+        ],
+    }
+}
+
+fn export_source_path(source_path: &str, options: AgentExportOptions) -> String {
+    if options.include_sensitive {
+        return source_path.to_string();
+    }
+    Path::new(source_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("terraform.tfstate")
+        .to_string()
+}
+
 #[derive(Default)]
 struct ResourceFindings {
     ids: Vec<String>,
@@ -589,6 +662,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::db::{open_cloudmapper_db, write_inventory_db};
+    use crate::demo::write_demo_bundle;
     use crate::model::{Generator, Inventory, Relationship, Resource, SCHEMA_VERSION};
     use crate::terraform_state::import_terraform_state_file;
 
@@ -604,10 +678,11 @@ mod tests {
         let tf_summary = import_terraform_state_file(&db_path, &state_path, None).unwrap();
         seed_finding(&db_path, &scan_id, &tf_summary.state_id);
 
-        let export = export_agent_bundle(&db_path, None, None, None).unwrap();
+        let export = export_agent_bundle(&db_path, None, None, None, redacted_options()).unwrap();
         let json = serde_json::to_value(&export).unwrap();
 
         assert_eq!(json["schema_version"], "cloudmapper.agent.v1");
+        assert_eq!(export.redaction.mode, "redacted");
         assert_eq!(export.scan.account.id, "123456789012");
         assert_eq!(export.counts.resources, 2);
         assert_eq!(export.counts.relationships, 1);
@@ -622,9 +697,51 @@ mod tests {
         assert_eq!(sg.terraform_addresses, vec!["aws_security_group.web"]);
         assert_eq!(sg.finding_ids, vec!["finding:public-sg"]);
         assert_eq!(sg.severity.as_deref(), Some("critical"));
+        assert_eq!(sg.attributes, json!({}));
+        assert!(sg.raw.is_none());
+        assert_eq!(export.terraform.resource_instances[0].attributes, json!({}));
+        assert_eq!(
+            export.terraform.resource_instances[0].sensitive_attributes,
+            json!([])
+        );
         assert_eq!(export.findings[0].blast_radius, vec![instance_uid()]);
         assert_eq!(export.graph.nodes.len(), 2);
         assert_eq!(export.graph.edges.len(), 1);
+    }
+
+    #[test]
+    fn agent_export_can_include_sensitive_details_explicitly() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("map.db");
+        let state_path = temp.path().join("terraform.tfstate");
+        let scan_id = write_inventory_db(&db_path, &sample_inventory()).unwrap();
+        std::fs::write(&state_path, SAMPLE_TFSTATE).unwrap();
+        let tf_summary = import_terraform_state_file(&db_path, &state_path, None).unwrap();
+        seed_finding(&db_path, &scan_id, &tf_summary.state_id);
+
+        let export = export_agent_bundle(
+            &db_path,
+            None,
+            None,
+            None,
+            AgentExportOptions {
+                include_sensitive: true,
+            },
+        )
+        .unwrap();
+        let sg = export
+            .resources
+            .iter()
+            .find(|resource| resource.id == "sg-123")
+            .unwrap();
+
+        assert_eq!(export.redaction.mode, "include_sensitive");
+        assert!(sg.attributes.get("ingress").is_some());
+        assert!(sg.raw.is_some());
+        assert_eq!(
+            export.terraform.resource_instances[0].attributes["arn"],
+            "arn:aws:ec2:us-east-1:123456789012:security-group/sg-123"
+        );
     }
 
     #[test]
@@ -633,9 +750,43 @@ mod tests {
         let db_path = temp.path().join("map.db");
         open_cloudmapper_db(&db_path).unwrap();
 
-        let error = export_agent_bundle(&db_path, None, None, None).unwrap_err();
+        let error =
+            export_agent_bundle(&db_path, None, None, None, redacted_options()).unwrap_err();
 
         assert!(error.to_string().contains("no AWS scan found"));
+    }
+
+    #[test]
+    fn large_demo_agent_export_keeps_redacted_snapshot_shape() {
+        let temp = tempdir().unwrap();
+        let summary = write_demo_bundle(temp.path(), false).unwrap();
+
+        let export =
+            export_agent_bundle(&summary.db_path, None, None, None, redacted_options()).unwrap();
+
+        assert_eq!(export.redaction.mode, "redacted");
+        assert_eq!(export.counts.resources, 414);
+        assert_eq!(export.counts.relationships, 528);
+        assert_eq!(export.counts.terraform_resource_instances, 100);
+        assert_eq!(export.counts.findings, 327);
+        assert_eq!(export.counts.scan_errors, 2);
+        assert_eq!(export.graph.nodes.len(), export.counts.resources);
+        assert_eq!(export.graph.edges.len(), export.counts.relationships);
+        assert!(
+            export
+                .resources
+                .iter()
+                .all(|resource| resource.raw.is_none())
+        );
+        assert!(
+            export
+                .resources
+                .iter()
+                .all(|resource| resource.attributes == json!({}))
+        );
+        assert!(export.terraform.resource_instances.iter().all(|resource| {
+            resource.attributes == json!({}) && resource.sensitive_attributes == json!([])
+        }));
     }
 
     fn seed_finding(db_path: &Path, scan_id: &str, state_id: &str) {
@@ -706,7 +857,7 @@ mod tests {
                         }]
                     }),
                     evidence: Vec::new(),
-                    raw: None,
+                    raw: Some(json!({ "GroupId": "sg-123", "GroupName": "web" })),
                 },
                 Resource {
                     uid: instance_uid(),
@@ -743,6 +894,12 @@ mod tests {
 
     fn instance_uid() -> String {
         "aws:123456789012:us-east-1:ec2:instance:i-123".to_string()
+    }
+
+    fn redacted_options() -> AgentExportOptions {
+        AgentExportOptions {
+            include_sensitive: false,
+        }
     }
 
     const SAMPLE_TFSTATE: &str = r#"

@@ -42,6 +42,7 @@ jobs:
         run: |
           mkdir -p dist
           tar -czf "dist/${{ matrix.archive }}" -C target/release cloudmapper
+          shasum -a 256 "dist/${{ matrix.archive }}" > "dist/${{ matrix.archive }}.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

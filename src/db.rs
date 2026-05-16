@@ -260,8 +260,13 @@ pub fn latest_terraform_state_id(connection: &Connection) -> Result<Option<Strin
 }
 
 fn scan_id(inventory: &Inventory) -> String {
+    let provider = inventory
+        .resources
+        .first()
+        .map(|resource| resource.provider.as_str())
+        .unwrap_or("aws");
     format!(
-        "aws:{}:{}",
+        "{provider}:{}:{}",
         inventory.account_id,
         inventory.collected_at.to_rfc3339()
     )

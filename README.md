@@ -1,10 +1,11 @@
 # cloudmapper
 
-`cloudmapper` is a standalone Rust CLI that exports AWS account reality into an
-agent-readable `infra/` bundle and `map.db` knowledge store. `map.db` is
-cloudmapper's map format, backed by SQLite so it remains easy to inspect and
-query. It is designed to feed agents structured resources, relationships,
-Terraform state mappings, drift findings, and a local Cytoscape graph UI.
+`cloudmapper` is a standalone Rust CLI that exports AWS and Kubernetes reality
+into an agent-readable `infra/` bundle and `map.db` knowledge store. `map.db`
+is cloudmapper's map format, backed by SQLite so it remains easy to inspect
+and query. It is designed to feed agents structured resources, relationships,
+Terraform state mappings, drift and security findings, and a local Cytoscape
+graph UI.
 
 AI-generated documentation is intentionally out of scope for this phase; it can
 be layered on top of the structured store later.
@@ -21,18 +22,79 @@ Useful local targets:
 
 - `make build` builds the CLI.
 - `make test` runs unit tests.
-- `make check` runs formatting, type checking, tests, and a debug build.
+- `make check` runs formatting, type checking, lints, tests, and a debug build.
+- `make clippy` runs Rust lints.
+- `make demo` writes a zero-AWS large-org demo bundle to `infra/`.
+- `make demo-k8s` writes a zero-cluster Kubernetes platform demo bundle to
+  `infra-k8s/`.
 - `make ui DB=infra/map.db` serves the local Cytoscape UI.
+- `make demo-ui` writes the demo bundle and serves it from `infra/map.db`.
+- `make demo-k8s-ui` writes the Kubernetes demo bundle and serves it from
+  `infra-k8s/map.db`.
 - `make loc` counts lines in source files.
 - `make clean` removes Cargo build output.
 
-## Usage
+## First Five Minutes
+
+Try the full local workflow without AWS credentials:
 
 ```bash
-cargo run -- scan --profile default --regions all --out infra
+make demo
+make demo-ui
 ```
 
-Useful options:
+Open `http://127.0.0.1:8765`. The demo bundle models a realistic large
+organization account with three regions, prod/stage/dev environments, six
+application teams, EC2 fleets, VPC networking, RDS databases, Lambda workers,
+S3 data buckets, IAM principals, a partial Terraform state, compare findings,
+`graph.json`, and a populated `infra/map.db`.
+
+Try the Kubernetes workflow without a live cluster:
+
+```bash
+make demo-k8s
+make demo-k8s-ui
+```
+
+Open `http://127.0.0.1:8765`. The Kubernetes demo models a large platform
+cluster with 430 resources, 567 relationships, prod/stage/dev/shared
+namespaces, platform nodes and storage classes, workloads across multiple
+teams, RBAC grants, public ingress paths, mounted Secrets/ConfigMaps/PVCs, and
+69 persisted security findings.
+
+The same workflow against an AWS account is:
+
+```bash
+cargo run -- scan aws --profile default --regions all --out infra
+cloudmapper terraform import --state terraform.tfstate --db infra/map.db
+cloudmapper compare --db infra/map.db --out findings.json
+cloudmapper ui --db infra/map.db --bind 127.0.0.1:8765
+cloudmapper export agent --db infra/map.db --out infra.agent.json
+```
+
+## Usage
+
+Scan AWS:
+
+```bash
+cargo run -- scan aws --profile default --regions all --out infra
+```
+
+Scan Kubernetes through kubectl:
+
+```bash
+cargo run -- scan k8s --context kind-prod --namespace all --out infra
+cloudmapper ui --db infra/map.db --bind 127.0.0.1:8765
+```
+
+Generate the advanced Kubernetes demo directly:
+
+```bash
+cargo run -- demo --provider k8s --out infra-k8s
+cloudmapper ui --db infra-k8s/map.db --bind 127.0.0.1:8765
+```
+
+Useful AWS options:
 
 - `--profile <name>` uses a named AWS profile. If omitted, the normal AWS
   credential chain is used.
@@ -46,6 +108,17 @@ Useful options:
   scanner supports it.
 - `--allow-non-empty-out` allows writing into a non-empty directory that does
   not already contain a cloudmapper manifest.
+
+Useful Kubernetes options:
+
+- `--context <name>` selects a kubeconfig context. If omitted, cloudmapper uses
+  `kubectl config current-context`.
+- `--kubeconfig <path>` passes an explicit kubeconfig path to kubectl.
+- `--namespace all` scans every namespace; pass a namespace name to limit
+  namespaced resources.
+- `--kubectl <path>` selects a kubectl executable.
+- `--include-raw` includes raw non-Secret and non-ConfigMap Kubernetes objects.
+  Secret and ConfigMap values remain redacted.
 
 ## Bundle Layout
 
@@ -72,13 +145,13 @@ Every resource has a stable `uid`:
 
 ```json
 {
-  "uid": "aws:123456789012:us-east-1:ec2:instance:i-abc123",
-  "provider": "aws",
-  "account_id": "123456789012",
-  "region": "us-east-1",
-  "service": "ec2",
-  "type": "instance",
-  "id": "i-abc123"
+  "uid": "k8s:kind-prod:prod:apps:deployment:prod/payments",
+  "provider": "k8s",
+  "account_id": "kind-prod",
+  "region": "prod",
+  "service": "apps",
+  "type": "deployment",
+  "id": "prod/payments"
 }
 ```
 
@@ -94,7 +167,7 @@ Relationships are explicit facts with evidence pointers:
 
 ## Current Coverage
 
-The core scanner collects:
+The AWS scanner collects:
 
 - STS account identity
 - EC2 regions
@@ -107,6 +180,24 @@ The core scanner collects:
 
 Recoverable failures are written to `errors.jsonl` so an account scan can still
 produce a usable inventory when a service, region, or permission fails.
+
+The Kubernetes scanner collects:
+
+- clusters via kubeconfig context, namespaces, and nodes
+- deployments, daemonsets, statefulsets, replicasets, and pods
+- services, ingresses, and network policies
+- service accounts, roles, role bindings, cluster roles, and cluster role
+  bindings
+- Secrets and ConfigMaps as redacted resources with data keys only
+- persistent volume claims, persistent volumes, and storage classes
+
+It derives relationships for ownership, pod service accounts, service
+selectors, ingress backends, RBAC grants, PVC/PV bindings, and pod mounts of
+Secrets, ConfigMaps, and PVCs. It also persists Kubernetes findings for
+privileged containers, hostPath mounts, host namespace access, missing network
+policies, public services and ingresses, overbroad RBAC, cluster-admin
+bindings, default service account usage, legacy service-account token Secrets,
+and resources without common IaC/GitOps ownership metadata.
 
 ## Map Database
 
@@ -154,7 +245,8 @@ reviewed and redacted.
 
 ## Compare
 
-After a scan and Terraform import, compare AWS reality with Terraform state:
+After an AWS scan and Terraform import, compare AWS reality with Terraform
+state:
 
 ```bash
 cloudmapper compare \
@@ -184,7 +276,10 @@ cloudmapper export agent \
 
 The agent export includes the latest scan, resources, relationships, Terraform
 resource mapping, compare findings, evidence, blast radius, recommended actions,
-and graph nodes/edges in one file. Use `--out -` to print the JSON to stdout.
+and graph nodes/edges in one file. It redacts raw scan details, resource
+attributes, Terraform state source paths, and Terraform attributes by default.
+Pass `--include-sensitive` only when the export will stay in a trusted local
+context. Use `--out -` to print the JSON to stdout.
 
 ## UI
 
@@ -194,11 +289,29 @@ Serve the local map database as a Cytoscape graph:
 cloudmapper ui --db infra/map.db --bind 127.0.0.1:8765
 ```
 
-Open `http://127.0.0.1:8765` to inspect the latest AWS scan, Terraform state
-mapping, relationships, and compare findings. Critical and high findings are
-overlaid directly on graph nodes, and the side panels provide service filters,
-Terraform-managed filtering, finding navigation, blast radius, and recommended
-actions.
+Open `http://127.0.0.1:8765` to inspect the latest AWS or Kubernetes scan,
+Terraform state mapping when present, relationships, and findings. Critical
+and high findings are overlaid directly on graph nodes, and the side panels
+provide service/environment/application filters, Terraform-managed filtering,
+finding navigation, blast radius, and recommended actions. The Cytoscape
+runtime is bundled into the CLI assets, so the local UI does not need to fetch
+JavaScript from a CDN.
+
+## Installation
+
+Install the local checkout with Cargo:
+
+```bash
+cargo install --path .
+```
+
+Generate shell completions to a file:
+
+```bash
+cloudmapper completions zsh > _cloudmapper
+cloudmapper completions bash > cloudmapper.bash
+cloudmapper completions fish > cloudmapper.fish
+```
 
 ## Errors
 
@@ -237,11 +350,12 @@ GitHub Actions runs on `main` pushes and pull requests:
 
 - `cargo fmt --check`
 - `cargo check --locked`
+- `cargo clippy --all-targets --locked -- -D warnings`
 - `cargo test --locked`
 - `cargo build --locked`
 
 Release builds run when a `v*` tag is pushed and publish Linux and macOS CLI
-archives to the GitHub release.
+archives plus SHA-256 checksum files to the GitHub release.
 
 ## Git Tagging
 

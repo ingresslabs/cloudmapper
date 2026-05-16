@@ -233,8 +233,19 @@ pub fn resource_uid(
     resource_type: &str,
     id: &str,
 ) -> String {
+    provider_resource_uid("aws", account_id, region, service, resource_type, id)
+}
+
+pub fn provider_resource_uid(
+    provider: &str,
+    account_id: &str,
+    region: &str,
+    service: &str,
+    resource_type: &str,
+    id: &str,
+) -> String {
     format!(
-        "aws:{account_id}:{region}:{service}:{resource_type}:{}",
+        "{provider}:{account_id}:{region}:{service}:{resource_type}:{}",
         sanitize_uid_segment(id)
     )
 }

@@ -5,96 +5,272 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>cloudmapper</title>
     <link rel="stylesheet" href="/app.css" />
-    <script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+    <script src="/cytoscape.min.js"></script>
+    <script src="/d3.min.js"></script>
   </head>
   <body>
+    <svg class="icon-defs" aria-hidden="true">
+      <symbol id="icon-search" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="7"></circle>
+        <path d="M20 20l-4-4"></path>
+      </symbol>
+      <symbol id="icon-resource" viewBox="0 0 24 24">
+        <path d="M4 7l8-4 8 4-8 4-8-4z"></path>
+        <path d="M4 7v10l8 4 8-4V7"></path>
+        <path d="M12 11v10"></path>
+      </symbol>
+      <symbol id="icon-relation" viewBox="0 0 24 24">
+        <circle cx="6" cy="12" r="3"></circle>
+        <circle cx="18" cy="6" r="3"></circle>
+        <circle cx="18" cy="18" r="3"></circle>
+        <path d="M9 11l6-4"></path>
+        <path d="M9 13l6 4"></path>
+      </symbol>
+      <symbol id="icon-managed" viewBox="0 0 24 24">
+        <path d="M4 7h16v10H4z"></path>
+        <path d="M8 12l3 3 5-6"></path>
+      </symbol>
+      <symbol id="icon-risk" viewBox="0 0 24 24">
+        <path d="M12 4l9 16H3L12 4z"></path>
+        <path d="M12 9v5"></path>
+        <path d="M12 17h.01"></path>
+      </symbol>
+      <symbol id="icon-finding" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9"></circle>
+        <path d="M12 7v6"></path>
+        <path d="M12 16h.01"></path>
+      </symbol>
+      <symbol id="icon-fit" viewBox="0 0 24 24">
+        <path d="M4 9V4h5"></path>
+        <path d="M20 9V4h-5"></path>
+        <path d="M4 15v5h5"></path>
+        <path d="M20 15v5h-5"></path>
+      </symbol>
+      <symbol id="icon-spread" viewBox="0 0 24 24">
+        <path d="M12 12L5 5"></path>
+        <path d="M12 12l7-7"></path>
+        <path d="M12 12l7 7"></path>
+        <path d="M12 12l-7 7"></path>
+        <path d="M5 5h5"></path>
+        <path d="M5 5v5"></path>
+        <path d="M19 5h-5"></path>
+        <path d="M19 5v5"></path>
+        <path d="M19 19h-5"></path>
+        <path d="M19 19v-5"></path>
+        <path d="M5 19h5"></path>
+        <path d="M5 19v-5"></path>
+      </symbol>
+      <symbol id="icon-reset" viewBox="0 0 24 24">
+        <path d="M4 12a8 8 0 1 0 3-6"></path>
+        <path d="M4 4v6h6"></path>
+      </symbol>
+      <symbol id="icon-copy" viewBox="0 0 24 24">
+        <path d="M8 8h10v12H8z"></path>
+        <path d="M6 16H4V4h12v2"></path>
+      </symbol>
+      <symbol id="icon-command" viewBox="0 0 24 24">
+        <path d="M9 6h6a3 3 0 0 1 0 6H9a3 3 0 0 1 0-6z"></path>
+        <path d="M9 12h6a3 3 0 0 1 0 6H9a3 3 0 0 1 0-6z"></path>
+      </symbol>
+      <symbol id="icon-all" viewBox="0 0 24 24">
+        <path d="M4 4h6v6H4z"></path>
+        <path d="M14 4h6v6h-6z"></path>
+        <path d="M4 14h6v6H4z"></path>
+        <path d="M14 14h6v6h-6z"></path>
+      </symbol>
+      <symbol id="icon-unmanaged" viewBox="0 0 24 24">
+        <path d="M7 7l10 10"></path>
+        <path d="M8 4H5a1 1 0 0 0-1 1v3"></path>
+        <path d="M16 20h3a1 1 0 0 0 1-1v-3"></path>
+        <path d="M20 8V5a1 1 0 0 0-1-1h-3"></path>
+        <path d="M4 16v3a1 1 0 0 0 1 1h3"></path>
+      </symbol>
+      <symbol id="icon-blast" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="2"></circle>
+        <circle cx="12" cy="12" r="7"></circle>
+        <path d="M12 3v3"></path>
+        <path d="M12 18v3"></path>
+        <path d="M3 12h3"></path>
+        <path d="M18 12h3"></path>
+      </symbol>
+      <symbol id="icon-agent" viewBox="0 0 24 24">
+        <path d="M12 3v3"></path>
+        <path d="M8 6h8a4 4 0 0 1 4 4v5a4 4 0 0 1-4 4H8a4 4 0 0 1-4-4v-5a4 4 0 0 1 4-4z"></path>
+        <path d="M9 12h.01"></path>
+        <path d="M15 12h.01"></path>
+        <path d="M9 16h6"></path>
+      </symbol>
+      <symbol id="icon-sun" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="4"></circle>
+        <path d="M12 2v2"></path>
+        <path d="M12 20v2"></path>
+        <path d="M4.93 4.93l1.41 1.41"></path>
+        <path d="M17.66 17.66l1.41 1.41"></path>
+        <path d="M2 12h2"></path>
+        <path d="M20 12h2"></path>
+        <path d="M4.93 19.07l1.41-1.41"></path>
+        <path d="M17.66 6.34l1.41-1.41"></path>
+      </symbol>
+      <symbol id="icon-moon" viewBox="0 0 24 24">
+        <path d="M20 14.5A8 8 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5z"></path>
+      </symbol>
+      <symbol id="icon-atlas" viewBox="0 0 24 24">
+        <path d="M4 5h16v14H4z"></path>
+        <path d="M4 10h16"></path>
+        <path d="M4 15h16"></path>
+        <path d="M9 5v14"></path>
+        <path d="M15 5v14"></path>
+      </symbol>
+      <symbol id="icon-attack" viewBox="0 0 24 24">
+        <path d="M4 12h6"></path>
+        <path d="M14 12h6"></path>
+        <path d="M17 9l3 3-3 3"></path>
+        <circle cx="12" cy="12" r="2"></circle>
+        <path d="M12 4v4"></path>
+        <path d="M12 16v4"></path>
+      </symbol>
+      <symbol id="icon-drift" viewBox="0 0 24 24">
+        <path d="M5 7h8"></path>
+        <path d="M5 17h8"></path>
+        <path d="M15 5l4 4-4 4"></path>
+        <path d="M19 9H9"></path>
+        <path d="M9 15l-4 4 4 4"></path>
+      </symbol>
+      <symbol id="icon-remediation" viewBox="0 0 24 24">
+        <path d="M4 12l5 5L20 6"></path>
+        <path d="M5 5h6"></path>
+        <path d="M5 19h14"></path>
+      </symbol>
+    </svg>
     <div class="shell">
       <header class="topbar">
         <div class="brand">
-          <span class="brand-mark"></span>
           <div>
-            <h1>cloudmapper</h1>
             <p id="db-line">map.db</p>
           </div>
         </div>
-        <div class="status-strip" aria-label="snapshot status">
-          <span class="status-pill">map.db</span>
-          <span id="scan-line">waiting for scan</span>
-        </div>
-        <div class="metrics" aria-label="summary">
-          <div><strong id="metric-resources">0</strong><span>resources</span></div>
-          <div><strong id="metric-edges">0</strong><span>edges</span></div>
-          <div><strong id="metric-managed">0</strong><span>terraform</span></div>
-          <div class="risk"><strong id="metric-risk">0</strong><span>critical/high</span></div>
-        </div>
-      </header>
 
-      <main class="workspace">
-        <aside class="filters">
-          <div class="field">
-            <label for="search">Search</label>
-            <input id="search" type="search" autocomplete="off" placeholder="name, service, arn" />
-          </div>
-          <div class="field">
-            <label for="severity">Severity</label>
-            <select id="severity">
-              <option value="">All</option>
+        <div class="top-controls" aria-label="graph actions">
+          <label class="search-control" title="Search">
+            <svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg>
+            <input id="search" type="search" autocomplete="off" aria-label="Search" />
+          </label>
+          <button id="mode-cycle" type="button" title="All" aria-label="All">
+            <svg class="icon" aria-hidden="true"><use href="#icon-all"></use></svg>
+          </button>
+          <button id="fit" type="button" title="Fit graph" aria-label="Fit graph">
+            <svg class="icon" aria-hidden="true"><use href="#icon-fit"></use></svg>
+          </button>
+          <button id="spread" type="button" title="Spread graph" aria-label="Spread graph">
+            <svg class="icon" aria-hidden="true"><use href="#icon-spread"></use></svg>
+          </button>
+          <button id="agent-copy" type="button" title="Copy agent context" aria-label="Copy agent context">
+            <svg class="icon" aria-hidden="true"><use href="#icon-agent"></use></svg>
+          </button>
+          <button id="theme-toggle" type="button" title="Light theme" aria-label="Light theme">
+            <svg class="icon" aria-hidden="true"><use href="#icon-sun"></use></svg>
+          </button>
+          <button id="palette-open" type="button" title="Command palette" aria-label="Command palette">
+            <svg class="icon" aria-hidden="true"><use href="#icon-command"></use></svg>
+          </button>
+          <div class="control-bank" hidden>
+            <select id="severity" aria-label="Severity">
+              <option value="">Severity</option>
               <option value="critical">Critical</option>
               <option value="high">High</option>
               <option value="medium">Medium</option>
               <option value="none">No finding</option>
             </select>
-          </div>
-          <div class="field">
-            <label for="service">Service</label>
-            <select id="service">
-              <option value="">All services</option>
+            <select id="service" aria-label="Service">
+              <option value="">Service</option>
             </select>
+            <select id="environment" aria-label="Environment">
+              <option value="">Environment</option>
+            </select>
+            <select id="application" aria-label="Application">
+              <option value="">Application</option>
+            </select>
+            <select id="provider" aria-label="Provider">
+              <option value="">Provider</option>
+            </select>
+            <select id="namespace" aria-label="Namespace">
+              <option value="">Namespace</option>
+            </select>
+            <select id="owner" aria-label="Owner">
+              <option value="">Owner</option>
+            </select>
+            <select id="layout" aria-label="Layout">
+              <option value="cose">Force</option>
+              <option value="breadthfirst">Layers</option>
+              <option value="circle">Circle</option>
+            </select>
+            <input id="findings-only" type="checkbox" aria-label="Findings only" />
+            <input id="managed-only" type="checkbox" aria-label="Terraform only" />
+            <button id="reset" type="button" title="Reset filters" aria-label="Reset filters"></button>
           </div>
-          <div class="toggles">
-            <label><input id="findings-only" type="checkbox" /> Findings only</label>
-            <label><input id="managed-only" type="checkbox" /> Terraform only</label>
-          </div>
-          <div class="actions">
-            <button id="fit" type="button" title="Fit graph">Fit</button>
-            <button id="reset" type="button" title="Reset filters">Reset</button>
-          </div>
-          <div class="service-list" id="service-list"></div>
+        </div>
+
+        <div class="metrics" aria-label="summary">
+          <span title="Resources"><svg class="icon" aria-hidden="true"><use href="#icon-resource"></use></svg><strong id="metric-resources">0</strong></span>
+          <span title="Relationships"><svg class="icon" aria-hidden="true"><use href="#icon-relation"></use></svg><strong id="metric-edges">0</strong></span>
+          <span title="Terraform managed"><svg class="icon" aria-hidden="true"><use href="#icon-managed"></use></svg><strong id="metric-managed">0</strong></span>
+          <span class="risk" title="Critical and high findings"><svg class="icon" aria-hidden="true"><use href="#icon-risk"></use></svg><strong id="metric-risk">0</strong></span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="inspector">
+          <section class="selection-panel" aria-label="Inspector">
+            <div id="selection" class="empty">No selection</div>
+          </section>
         </aside>
 
         <section class="graph-pane">
-          <div class="graph-toolbar">
-            <div>
-              <strong id="graph-title">Infrastructure graph</strong>
-              <span id="graph-subtitle">latest snapshot</span>
-            </div>
-            <div class="graph-controls">
-              <div class="legend" aria-label="graph legend">
-                <span><i class="dot critical"></i>critical</span>
-                <span><i class="dot high"></i>high</span>
-                <span><i class="dot managed"></i>terraform</span>
-              </div>
-              <select id="layout" title="Layout">
-                <option value="breadthfirst">Layers</option>
-                <option value="cose">Force</option>
-                <option value="circle">Circle</option>
-              </select>
-            </div>
+          <div class="graph-status" aria-label="snapshot status">
+            <span id="graph-subtitle">latest snapshot</span>
+            <span id="scan-line">waiting for scan</span>
+            <span id="visible-count">0 / 0</span>
+            <span id="risk-summary" class="risk-summary" hidden></span>
+          </div>
+          <div class="view-switcher" aria-label="View mode">
+            <button class="view-button active" type="button" data-view="graph" title="Graph" aria-label="Graph">
+              <svg class="icon" aria-hidden="true"><use href="#icon-relation"></use></svg>
+            </button>
+            <button class="view-button" type="button" data-view="exposure" title="Exposure atlas" aria-label="Exposure atlas">
+              <svg class="icon" aria-hidden="true"><use href="#icon-atlas"></use></svg>
+            </button>
+            <button class="view-button" type="button" data-view="groups" title="Groups" aria-label="Groups">
+              <svg class="icon" aria-hidden="true"><use href="#icon-all"></use></svg>
+            </button>
+            <button class="view-button" type="button" data-view="attack" title="Attack paths" aria-label="Attack paths">
+              <svg class="icon" aria-hidden="true"><use href="#icon-attack"></use></svg>
+            </button>
+            <button class="view-button" type="button" data-view="drift" title="Drift" aria-label="Drift">
+              <svg class="icon" aria-hidden="true"><use href="#icon-drift"></use></svg>
+            </button>
+            <button class="view-button" type="button" data-view="remediation" title="Remediation" aria-label="Remediation">
+              <svg class="icon" aria-hidden="true"><use href="#icon-remediation"></use></svg>
+            </button>
           </div>
           <div id="cy"></div>
+          <div id="d3-view" class="d3-view" hidden></div>
         </section>
 
-        <aside class="inspector">
-          <section>
-            <h2>Selection</h2>
-            <div id="selection" class="empty">Select a node or finding</div>
-          </section>
-          <section>
-            <h2>Findings</h2>
+        <aside class="sidebar findings-sidebar">
+          <section class="findings-panel" aria-label="Findings">
             <div id="findings" class="finding-list"></div>
           </section>
         </aside>
       </main>
+    </div>
+    <div id="palette" class="palette" hidden>
+      <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
+        <label class="palette-search">
+          <svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg>
+          <input id="palette-input" type="search" autocomplete="off" aria-label="Command" />
+        </label>
+        <div id="palette-list" class="palette-list"></div>
+      </div>
     </div>
     <script src="/app.js"></script>
   </body>
