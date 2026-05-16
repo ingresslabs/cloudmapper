@@ -387,9 +387,9 @@ archives plus SHA-256 checksum files to the GitHub release.
 Use annotated SemVer tags:
 
 ```bash
-git tag -a v0.1.0 -m "cloudmapper v0.1.0"
+git tag -a v0.1.1 -m "cloudmapper v0.1.1"
 git push origin main
-git push origin v0.1.0
+git push origin v0.1.1
 ```
 
 Do not move published tags. If a release tag is wrong, create the next patch tag.

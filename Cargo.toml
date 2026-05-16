@@ -1,9 +1,9 @@
 [package]
 name = "cloudmapper"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "AWS infrastructure inventory exporter for agent-readable JSON and graph artifacts"
-repository = "https://github.com/avkcode/cloudmapper"
+repository = "https://github.com/ingresslabs/cloudmapper"
 publish = false
 rust-version = "1.85"
 
