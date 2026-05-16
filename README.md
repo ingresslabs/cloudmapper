@@ -1,11 +1,34 @@
 # cloudmapper
 
-`cloudmapper` is a standalone Rust CLI that exports AWS and Kubernetes reality
-into an agent-readable `infra/` bundle and `map.db` knowledge store. `map.db`
-is cloudmapper's map format, backed by SQLite so it remains easy to inspect
-and query. It is designed to feed agents structured resources, relationships,
-Terraform state mappings, drift and security findings, and a local Cytoscape
-graph UI.
+`cloudmapper` is a standalone Rust CLI that maps AWS and Kubernetes reality
+into an agent-readable `infra/` bundle and queryable `map.db` knowledge store.
+It feeds agents structured resources, relationships, Terraform state mappings,
+drift and security findings, and a local graph UI backed by SQLite.
+
+[GitHub repository](https://github.com/avkcode/cloudmapper) ·
+[Latest release](https://github.com/avkcode/cloudmapper/releases/latest)
+
+## Install
+
+Linux:
+
+```bash
+curl -L https://github.com/avkcode/cloudmapper/releases/latest/download/cloudmapper-linux.tar.gz | tar -xz
+sudo install -m 0755 cloudmapper /usr/local/bin/cloudmapper
+```
+
+macOS:
+
+```bash
+curl -L https://github.com/avkcode/cloudmapper/releases/latest/download/cloudmapper-macos.tar.gz | tar -xz
+sudo install -m 0755 cloudmapper /usr/local/bin/cloudmapper
+```
+
+## Screenshots
+
+| AWS demo | Kubernetes demo |
+| --- | --- |
+| ![AWS demo exposure atlas showing resources and findings](docs/screenshots/aws-demo.png) | ![Kubernetes demo exposure atlas showing namespaces, workloads, and findings](docs/screenshots/k8s-demo.png) |
 
 AI-generated documentation is intentionally out of scope for this phase; it can
 be layered on top of the structured store later.
@@ -297,7 +320,7 @@ finding navigation, blast radius, and recommended actions. The Cytoscape
 runtime is bundled into the CLI assets, so the local UI does not need to fetch
 JavaScript from a CDN.
 
-## Installation
+## Local Installation
 
 Install the local checkout with Cargo:
 
