@@ -5,31 +5,32 @@ into an agent-readable `infra/` bundle and queryable `map.db` knowledge store.
 It feeds agents structured resources, relationships, Terraform state mappings,
 drift and security findings, and a local graph UI backed by SQLite.
 
-[GitHub repository](https://github.com/avkcode/cloudmapper) ·
-[Landing page](https://avkcode.github.io/cloudmapper/) ·
-[Latest release](https://github.com/avkcode/cloudmapper/releases/latest)
+[GitHub repository](https://github.com/ingresslabs/cloudmapper) ·
+[Latest release](https://github.com/ingresslabs/cloudmapper/releases/latest)
 
 ## Install
 
 Linux:
 
 ```bash
-curl -L https://github.com/avkcode/cloudmapper/releases/latest/download/cloudmapper-linux.tar.gz | tar -xz
+curl -L https://github.com/ingresslabs/cloudmapper/releases/latest/download/cloudmapper-linux.tar.gz | tar -xz
 sudo install -m 0755 cloudmapper /usr/local/bin/cloudmapper
 ```
 
 macOS:
 
 ```bash
-curl -L https://github.com/avkcode/cloudmapper/releases/latest/download/cloudmapper-macos.tar.gz | tar -xz
+curl -L https://github.com/ingresslabs/cloudmapper/releases/latest/download/cloudmapper-macos.tar.gz | tar -xz
 sudo install -m 0755 cloudmapper /usr/local/bin/cloudmapper
 ```
 
 ## Screenshots
 
-| AWS demo | Kubernetes demo |
-| --- | --- |
-| ![AWS demo Cytoscape node graph showing resources, relationships, and findings](docs/screenshots/aws-demo.png) | ![Kubernetes demo Cytoscape node graph showing resources, relationships, and findings](docs/screenshots/k8s-demo.png) |
+![Kubernetes graph inspector view](docs/screenshots/k8s-graph-detail.png)
+![Kubernetes graph overview](docs/screenshots/k8s-graph-overview.png)
+![AWS attack paths view](docs/screenshots/aws-attack-paths.png)
+![AWS graph inspector view](docs/screenshots/aws-graph-detail.png)
+![Kubernetes exposure atlas inspector view](docs/screenshots/k8s-exposure-atlas.png)
 
 AI-generated documentation is intentionally out of scope for this phase; it can
 be layered on top of the structured store later.
