@@ -1,5 +1,6 @@
 mod agent_export;
 mod aws_scan;
+mod cli_progress;
 mod compare;
 mod cost;
 mod db;
@@ -20,6 +21,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use crate::agent_export::{AgentExportOptions, export_agent_bundle};
 use crate::aws_scan::{ScanOptions, scan_account};
+use crate::cli_progress::IngestAnimation;
 use crate::compare::compare_infra;
 use crate::cost::{
     CostActualOptions, default_cost_metric, import_actual_costs, write_estimated_costs,
@@ -357,8 +359,29 @@ async fn run() -> Result<()> {
                     home_region: args.home_region,
                     include_raw: args.include_raw,
                 };
-                let inventory = scan_account(options).await?;
-                write_infra(&args.out, &inventory, args.allow_non_empty_out)?;
+                let progress = IngestAnimation::start("aws", args.out.join("map.db"));
+                progress.stage("discovering AWS resources");
+                let inventory = match scan_account(options).await {
+                    Ok(inventory) => inventory,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.stage("writing bundle and map.db");
+                let scan_id = match write_infra(&args.out, &inventory, args.allow_non_empty_out) {
+                    Ok(scan_id) => scan_id,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.finish(format!(
+                    "{} resources, {} relationships, scan {}",
+                    inventory.resources.len(),
+                    inventory.relationships.len(),
+                    scan_id
+                ));
                 println!(
                     "wrote {} AWS resources, {} relationships, and {} scan errors to {}",
                     inventory.resources.len(),
@@ -372,16 +395,49 @@ async fn run() -> Result<()> {
                 );
             }
             ScanCommand::K8s(args) => {
-                let output = scan_cluster(K8sScanOptions {
+                let scan_options = K8sScanOptions {
                     context: args.context,
                     kubeconfig: args.kubeconfig,
                     namespace: args.namespace,
                     kubectl: args.kubectl,
                     include_raw: args.include_raw,
-                })?;
-                let scan_id = write_infra(&args.out, &output.inventory, args.allow_non_empty_out)?;
-                let findings_run_id =
-                    write_k8s_findings(&args.out.join("map.db"), &scan_id, &output.findings)?;
+                };
+                let progress = IngestAnimation::start("k8s", args.out.join("map.db"));
+                progress.stage("reading Kubernetes API");
+                let output = match scan_cluster(scan_options) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.stage("writing bundle and map.db");
+                let scan_id =
+                    match write_infra(&args.out, &output.inventory, args.allow_non_empty_out) {
+                        Ok(scan_id) => scan_id,
+                        Err(error) => {
+                            progress.fail();
+                            return Err(error);
+                        }
+                    };
+                progress.stage("storing findings");
+                let findings_run_id = match write_k8s_findings(
+                    &args.out.join("map.db"),
+                    &scan_id,
+                    &output.findings,
+                ) {
+                    Ok(run_id) => run_id,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.finish(format!(
+                    "{} resources, {} relationships, {} findings",
+                    output.inventory.resources.len(),
+                    output.inventory.relationships.len(),
+                    output.findings.len()
+                ));
                 println!(
                     "wrote {} Kubernetes resources, {} relationships, {} findings, and {} scan errors to {}",
                     output.inventory.resources.len(),
@@ -399,7 +455,19 @@ async fn run() -> Result<()> {
         },
         Command::Demo(args) => match args.provider {
             DemoProvider::Aws => {
-                let summary = write_demo_bundle(&args.out, args.allow_non_empty_out)?;
+                let progress = IngestAnimation::start("demo aws", args.out.join("map.db"));
+                progress.stage("generating demo cloud inventory");
+                let summary = match write_demo_bundle(&args.out, args.allow_non_empty_out) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.finish(format!(
+                    "{} resources, {} relationships, {} findings",
+                    summary.resources, summary.relationships, summary.findings
+                ));
                 println!(
                     "wrote AWS large-org demo bundle with {} resources, {} relationships, and {} findings to {}",
                     summary.resources,
@@ -419,7 +487,19 @@ async fn run() -> Result<()> {
                 );
             }
             DemoProvider::K8s => {
-                let summary = write_k8s_demo_bundle(&args.out, args.allow_non_empty_out)?;
+                let progress = IngestAnimation::start("demo k8s", args.out.join("map.db"));
+                progress.stage("generating demo cluster inventory");
+                let summary = match write_k8s_demo_bundle(&args.out, args.allow_non_empty_out) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.finish(format!(
+                    "{} resources, {} relationships, {} findings",
+                    summary.resources, summary.relationships, summary.findings
+                ));
                 println!(
                     "wrote Kubernetes platform demo bundle with {} resources, {} relationships, and {} findings to {}",
                     summary.resources,
