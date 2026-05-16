@@ -15,6 +15,8 @@ const APP_CSS: &str = include_str!("ui_assets/app.css");
 const APP_JS: &str = include_str!("ui_assets/app.js");
 const CYTOSCAPE_JS: &str = include_str!("ui_assets/cytoscape.min.js");
 const D3_JS: &str = include_str!("ui_assets/d3.min.js");
+const XTERM_CSS: &str = include_str!("ui_assets/xterm.css");
+const XTERM_JS: &str = include_str!("ui_assets/xterm.js");
 
 #[derive(Clone)]
 struct UiState {
@@ -210,6 +212,10 @@ fn route_request(path: &str, state: &UiState) -> Result<Option<UiBody>> {
             content_type: "text/css; charset=utf-8",
             body: APP_CSS.as_bytes(),
         },
+        "/xterm.css" => UiBody::Static {
+            content_type: "text/css; charset=utf-8",
+            body: XTERM_CSS.as_bytes(),
+        },
         "/app.js" => UiBody::Static {
             content_type: "application/javascript; charset=utf-8",
             body: APP_JS.as_bytes(),
@@ -221,6 +227,10 @@ fn route_request(path: &str, state: &UiState) -> Result<Option<UiBody>> {
         "/d3.min.js" => UiBody::Static {
             content_type: "application/javascript; charset=utf-8",
             body: D3_JS.as_bytes(),
+        },
+        "/xterm.js" => UiBody::Static {
+            content_type: "application/javascript; charset=utf-8",
+            body: XTERM_JS.as_bytes(),
         },
         "/api/summary" => UiBody::Json(serde_json::to_vec(&load_summary(&state.db_path)?)?),
         "/api/graph" => UiBody::Json(serde_json::to_vec(&load_graph(&state.db_path)?)?),
@@ -794,15 +804,21 @@ mod tests {
         assert!(INDEX_HTML.contains("class=\"panel-toggle\""));
         assert!(INDEX_HTML.contains("data-theme=\"light\""));
         assert!(INDEX_HTML.contains("class=\"graph-header\""));
+        assert!(INDEX_HTML.contains("data-view=\"mission\""));
+        assert!(INDEX_HTML.contains("/xterm.css"));
+        assert!(INDEX_HTML.contains("/xterm.js"));
         assert!(INDEX_HTML.contains("icon-spread"));
         assert!(INDEX_HTML.contains("icon-panel-left"));
         assert!(INDEX_HTML.contains("icon-panel-right"));
         assert!(APP_CSS.contains("#spread.active"));
+        assert!(APP_CSS.contains(".mission-terminal"));
         assert!(APP_CSS.contains(".workspace.hide-inspector"));
         assert!(APP_CSS.contains(".workspace.hide-findings"));
         assert!(APP_JS.contains("function spreadGraph()"));
+        assert!(APP_JS.contains("function renderMissionTerminal()"));
         assert!(APP_JS.contains("function toggleSpreadMode()"));
         assert!(APP_JS.contains("function togglePanel(panel)"));
+        assert!(XTERM_JS.contains("Terminal"));
         assert!(APP_JS.contains("? theme : \"light\""));
         assert!(APP_JS.contains("params.set(\"spread\", \"1\")"));
         assert!(APP_JS.contains("params.set(\"inspector\", \"0\")"));
