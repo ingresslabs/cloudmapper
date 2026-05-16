@@ -28,7 +28,7 @@ sudo install -m 0755 cloudmapper /usr/local/bin/cloudmapper
 
 | AWS demo | Kubernetes demo |
 | --- | --- |
-| ![AWS demo exposure atlas showing resources and findings](docs/screenshots/aws-demo.png) | ![Kubernetes demo exposure atlas showing namespaces, workloads, and findings](docs/screenshots/k8s-demo.png) |
+| ![AWS demo Cytoscape node graph showing resources, relationships, and findings](docs/screenshots/aws-demo.png) | ![Kubernetes demo Cytoscape node graph showing resources, relationships, and findings](docs/screenshots/k8s-demo.png) |
 
 AI-generated documentation is intentionally out of scope for this phase; it can
 be layered on top of the structured store later.
