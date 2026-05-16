@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cloudmapper</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <div>
+            <h1>cloudmapper</h1>
+            <p id="db-line">infra.sqlite</p>
+          </div>
+        </div>
+        <div class="status-strip" aria-label="snapshot status">
+          <span class="status-pill">SQLite</span>
+          <span id="scan-line">waiting for scan</span>
+        </div>
+        <div class="metrics" aria-label="summary">
+          <div><strong id="metric-resources">0</strong><span>resources</span></div>
+          <div><strong id="metric-edges">0</strong><span>edges</span></div>
+          <div><strong id="metric-managed">0</strong><span>terraform</span></div>
+          <div class="risk"><strong id="metric-risk">0</strong><span>critical/high</span></div>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="filters">
+          <div class="field">
+            <label for="search">Search</label>
+            <input id="search" type="search" autocomplete="off" placeholder="name, service, arn" />
+          </div>
+          <div class="field">
+            <label for="severity">Severity</label>
+            <select id="severity">
+              <option value="">All</option>
+              <option value="critical">Critical</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="none">No finding</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="service">Service</label>
+            <select id="service">
+              <option value="">All services</option>
+            </select>
+          </div>
+          <div class="toggles">
+            <label><input id="findings-only" type="checkbox" /> Findings only</label>
+            <label><input id="managed-only" type="checkbox" /> Terraform only</label>
+          </div>
+          <div class="actions">
+            <button id="fit" type="button" title="Fit graph">Fit</button>
+            <button id="reset" type="button" title="Reset filters">Reset</button>
+          </div>
+          <div class="service-list" id="service-list"></div>
+        </aside>
+
+        <section class="graph-pane">
+          <div class="graph-toolbar">
+            <div>
+              <strong id="graph-title">Infrastructure graph</strong>
+              <span id="graph-subtitle">latest snapshot</span>
+            </div>
+            <div class="graph-controls">
+              <div class="legend" aria-label="graph legend">
+                <span><i class="dot critical"></i>critical</span>
+                <span><i class="dot high"></i>high</span>
+                <span><i class="dot managed"></i>terraform</span>
+              </div>
+              <select id="layout" title="Layout">
+                <option value="breadthfirst">Layers</option>
+                <option value="cose">Force</option>
+                <option value="circle">Circle</option>
+              </select>
+            </div>
+          </div>
+          <div id="cy"></div>
+        </section>
+
+        <aside class="inspector">
+          <section>
+            <h2>Selection</h2>
+            <div id="selection" class="empty">Select a node or finding</div>
+          </section>
+          <section>
+            <h2>Findings</h2>
+            <div id="findings" class="finding-list"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
