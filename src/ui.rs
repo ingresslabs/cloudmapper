@@ -1,12 +1,19 @@
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha1::{Digest, Sha1};
+use tungstenite::{Error as WebSocketError, Message, protocol::Role};
 
 use crate::db::{latest_terraform_state_id, open_cloudmapper_db};
 
@@ -17,6 +24,14 @@ const CYTOSCAPE_JS: &str = include_str!("ui_assets/cytoscape.min.js");
 const D3_JS: &str = include_str!("ui_assets/d3.min.js");
 const XTERM_CSS: &str = include_str!("ui_assets/xterm.css");
 const XTERM_JS: &str = include_str!("ui_assets/xterm.js");
+const TERMINAL_READ_TIMEOUT: Duration = Duration::from_millis(25);
+const TERMINAL_LOOP_DELAY: Duration = Duration::from_millis(8);
+const TERMINAL_DEFAULT_COLS: u16 = 100;
+const TERMINAL_DEFAULT_ROWS: u16 = 28;
+const TERMINAL_MIN_COLS: u16 = 40;
+const TERMINAL_MAX_COLS: u16 = 220;
+const TERMINAL_MIN_ROWS: u16 = 10;
+const TERMINAL_MAX_ROWS: u16 = 80;
 
 #[derive(Clone)]
 struct UiState {
@@ -128,6 +143,20 @@ struct FindingOverlay {
     finding_types: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TerminalPtyControl {
+    kind: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+struct TerminalPtySession {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+}
+
 enum UiBody {
     Static {
         content_type: &'static str,
@@ -135,6 +164,8 @@ enum UiBody {
     },
     Json(Vec<u8>),
 }
+
+type Headers = BTreeMap<String, String>;
 
 pub fn serve_ui(db_path: &Path, bind: &str) -> Result<()> {
     let listener = TcpListener::bind(bind).with_context(|| format!("binding UI server {bind}"))?;
@@ -147,9 +178,12 @@ pub fn serve_ui(db_path: &Path, bind: &str) -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_connection(stream, &state) {
-                    eprintln!("ui request error: {error:#}");
-                }
+                let state = state.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_connection(stream, &state) {
+                        eprintln!("ui request error: {error:#}");
+                    }
+                });
             }
             Err(error) => eprintln!("ui connection error: {error}"),
         }
@@ -165,6 +199,7 @@ fn handle_connection(mut stream: TcpStream, state: &UiState) -> Result<()> {
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or("/");
 
+    let mut headers = Headers::new();
     let mut header = String::new();
     loop {
         header.clear();
@@ -172,6 +207,14 @@ fn handle_connection(mut stream: TcpStream, state: &UiState) -> Result<()> {
         if header == "\r\n" || header.is_empty() {
             break;
         }
+        if let Some((name, value)) = header.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    let (path, query) = split_target(target);
+    if method == "GET" && path == "/api/terminal/pty" && is_websocket_upgrade(&headers) {
+        return handle_terminal_pty_websocket(stream, &headers, query);
     }
 
     if method != "GET" {
@@ -183,7 +226,6 @@ fn handle_connection(mut stream: TcpStream, state: &UiState) -> Result<()> {
         );
     }
 
-    let path = target.split('?').next().unwrap_or("/");
     match route_request(path, state) {
         Ok(Some(UiBody::Static { content_type, body })) => {
             write_response(&mut stream, 200, content_type, body)
@@ -207,6 +249,10 @@ fn route_request(path: &str, state: &UiState) -> Result<Option<UiBody>> {
         "/" | "/index.html" => UiBody::Static {
             content_type: "text/html; charset=utf-8",
             body: INDEX_HTML.as_bytes(),
+        },
+        "/favicon.ico" => UiBody::Static {
+            content_type: "image/x-icon",
+            body: b"",
         },
         "/app.css" => UiBody::Static {
             content_type: "text/css; charset=utf-8",
@@ -240,6 +286,249 @@ fn route_request(path: &str, state: &UiState) -> Result<Option<UiBody>> {
     Ok(Some(body))
 }
 
+fn split_target(target: &str) -> (&str, &str) {
+    target.split_once('?').unwrap_or((target, ""))
+}
+
+fn is_websocket_upgrade(headers: &Headers) -> bool {
+    let upgrade = headers
+        .get("upgrade")
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    let connection = headers.get("connection").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+    });
+    upgrade && connection && headers.contains_key("sec-websocket-key")
+}
+
+fn handle_terminal_pty_websocket(
+    mut stream: TcpStream,
+    headers: &Headers,
+    query: &str,
+) -> Result<()> {
+    let Some(key) = headers.get("sec-websocket-key") else {
+        return write_response(
+            &mut stream,
+            400,
+            "application/json",
+            br#"{"error":"missing websocket key"}"#,
+        );
+    };
+    let size = terminal_pty_size(query);
+    let mut session = match spawn_terminal_pty(size) {
+        Ok(session) => session,
+        Err(error) => {
+            let body = serde_json::to_vec(&json!({ "error": error.to_string() }))?;
+            return write_response(&mut stream, 500, "application/json", &body);
+        }
+    };
+
+    let accept_key = websocket_accept_key(key);
+    write!(
+        stream,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\nCache-Control: no-store\r\n\r\n"
+    )?;
+    stream.flush()?;
+    stream.set_read_timeout(Some(TERMINAL_READ_TIMEOUT))?;
+
+    let mut websocket = tungstenite::WebSocket::from_raw_socket(stream, Role::Server, None);
+    let result = bridge_terminal_pty(&mut websocket, &mut session);
+    let _ = session.child.kill();
+    let _ = session.child.wait();
+    result
+}
+
+fn spawn_terminal_pty(size: PtySize) -> Result<TerminalPtySession> {
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(size).context("opening terminal PTY")?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("cloning PTY reader")?;
+    let writer = pair.master.take_writer().context("opening PTY writer")?;
+    let mut command = CommandBuilder::new(terminal_shell());
+    command.cwd(std::env::current_dir()?.as_os_str());
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "cloudmapper");
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .context("starting terminal shell")?;
+    drop(pair.slave);
+
+    let (output_tx, output_rx) = mpsc::channel();
+    thread::spawn(move || read_terminal_pty(reader, output_tx));
+
+    Ok(TerminalPtySession {
+        child,
+        master: pair.master,
+        writer,
+        output_rx,
+    })
+}
+
+fn read_terminal_pty(mut reader: Box<dyn Read + Send>, output_tx: mpsc::Sender<Vec<u8>>) {
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                if output_tx.send(buffer[..bytes_read].to_vec()).is_err() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn bridge_terminal_pty(
+    websocket: &mut tungstenite::WebSocket<TcpStream>,
+    session: &mut TerminalPtySession,
+) -> Result<()> {
+    loop {
+        if !drain_pty_output(websocket, session)? {
+            break;
+        }
+        match websocket.read() {
+            Ok(message) => {
+                if !handle_terminal_websocket_message(message, session)? {
+                    break;
+                }
+            }
+            Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => break,
+            Err(WebSocketError::Io(error))
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => return Err(error).context("reading terminal websocket"),
+        }
+        if session.child.try_wait()?.is_some() {
+            drain_pty_output(websocket, session)?;
+            break;
+        }
+        thread::sleep(TERMINAL_LOOP_DELAY);
+    }
+    let _ = websocket.close(None);
+    Ok(())
+}
+
+fn drain_pty_output(
+    websocket: &mut tungstenite::WebSocket<TcpStream>,
+    session: &mut TerminalPtySession,
+) -> Result<bool> {
+    loop {
+        match session.output_rx.try_recv() {
+            Ok(chunk) => {
+                websocket
+                    .write(Message::binary(chunk))
+                    .context("writing terminal output websocket frame")?;
+                websocket.flush().context("flushing terminal websocket")?;
+            }
+            Err(TryRecvError::Empty) => return Ok(true),
+            Err(TryRecvError::Disconnected) => return Ok(false),
+        }
+    }
+}
+
+fn handle_terminal_websocket_message(
+    message: Message,
+    session: &mut TerminalPtySession,
+) -> Result<bool> {
+    match message {
+        Message::Binary(bytes) => {
+            session
+                .writer
+                .write_all(bytes.as_ref())
+                .context("writing terminal input")?;
+            session.writer.flush().context("flushing terminal input")?;
+        }
+        Message::Text(text) => {
+            if let Ok(control) = serde_json::from_str::<TerminalPtyControl>(text.as_str()) {
+                if control.kind == "resize" {
+                    session
+                        .master
+                        .resize(terminal_control_size(&control))
+                        .context("resizing terminal PTY")?;
+                    return Ok(true);
+                }
+            }
+            session
+                .writer
+                .write_all(text.as_str().as_bytes())
+                .context("writing terminal text input")?;
+            session.writer.flush().context("flushing terminal input")?;
+        }
+        Message::Close(_) => return Ok(false),
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+    }
+    Ok(true)
+}
+
+fn terminal_shell() -> String {
+    std::env::var("CLOUDMAPPER_TERMINAL_SHELL")
+        .ok()
+        .filter(|value| executable_path(value))
+        .or_else(|| {
+            std::env::var("SHELL")
+                .ok()
+                .filter(|value| executable_path(value))
+        })
+        .or_else(|| {
+            if executable_path("/bin/bash") {
+                Some("/bin/bash".to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+fn executable_path(path: &str) -> bool {
+    !path.is_empty() && Path::new(path).is_file()
+}
+
+fn terminal_pty_size(query: &str) -> PtySize {
+    PtySize {
+        rows: clamp_terminal_rows(query_param_u16(query, "rows").unwrap_or(TERMINAL_DEFAULT_ROWS)),
+        cols: clamp_terminal_cols(query_param_u16(query, "cols").unwrap_or(TERMINAL_DEFAULT_COLS)),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+fn terminal_control_size(control: &TerminalPtyControl) -> PtySize {
+    PtySize {
+        rows: clamp_terminal_rows(control.rows.unwrap_or(TERMINAL_DEFAULT_ROWS)),
+        cols: clamp_terminal_cols(control.cols.unwrap_or(TERMINAL_DEFAULT_COLS)),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+fn query_param_u16(query: &str, key: &str) -> Option<u16> {
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then(|| value.parse::<u16>().ok()).flatten()
+    })
+}
+
+fn clamp_terminal_cols(cols: u16) -> u16 {
+    cols.clamp(TERMINAL_MIN_COLS, TERMINAL_MAX_COLS)
+}
+
+fn clamp_terminal_rows(rows: u16) -> u16 {
+    rows.clamp(TERMINAL_MIN_ROWS, TERMINAL_MAX_ROWS)
+}
+
+fn websocket_accept_key(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.trim().as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    BASE64_STANDARD.encode(hasher.finalize())
+}
+
 fn write_response(
     stream: &mut TcpStream,
     status: u16,
@@ -248,6 +537,7 @@ fn write_response(
 ) -> Result<()> {
     let status_text = match status {
         200 => "OK",
+        400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
@@ -825,6 +1115,25 @@ mod tests {
         assert!(APP_JS.contains("params.set(\"findingsPanel\", \"0\")"));
         assert!(APP_JS.contains("Spread graph"));
         assert!(APP_JS.contains("Compact graph"));
+    }
+
+    #[test]
+    fn websocket_accept_key_matches_rfc_example() {
+        assert_eq!(
+            websocket_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn terminal_pty_size_uses_browser_dimensions_with_bounds() {
+        let size = terminal_pty_size("cols=132&rows=34");
+        assert_eq!(size.cols, 132);
+        assert_eq!(size.rows, 34);
+
+        let clamped = terminal_pty_size("cols=1&rows=999");
+        assert_eq!(clamped.cols, TERMINAL_MIN_COLS);
+        assert_eq!(clamped.rows, TERMINAL_MAX_ROWS);
     }
 
     fn sample_inventory() -> Inventory {

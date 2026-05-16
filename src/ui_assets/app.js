@@ -30,6 +30,8 @@ const state = {
     resizeObserver: null,
     container: null,
     text: "",
+    socket: null,
+    socketReady: false,
   },
   filters: {
     search: "",
@@ -386,7 +388,6 @@ function renderGraph(payload) {
     elements,
     minZoom: 0.08,
     maxZoom: 1.35,
-    wheelSensitivity: 0.16,
     style: [
       {
         selector: "node",
@@ -401,7 +402,7 @@ function renderGraph(payload) {
           "border-width": (ele) => ele.data("terraformAddress") || ele.data("severity") ? 2.6 : 1.5,
           "label": "data(label)",
           "font-size": 9,
-          "font-weight": 650,
+          "font-weight": 600,
           "color": theme.nodeLabel,
           "text-wrap": "wrap",
           "text-max-width": 92,
@@ -648,7 +649,7 @@ function renderMissionTerminal() {
     <div class="mission-split">
       <section class="mission-stage" aria-label="Mission">
         <div class="mission-header">
-          <span class="d3-view-title">Mission Terminal</span>
+          <span class="d3-view-title">Local AI Terminal</span>
           <div class="d3-view-stats">
             <span><strong>${mission.visibleResources}</strong> scoped</span>
             <span><strong>${mission.findings.length}</strong> findings</span>
@@ -680,7 +681,7 @@ function renderMissionTerminal() {
       </section>
       <section class="mission-console" aria-label="Terminal">
         <div class="mission-console-header">
-          <span>cloudmapper-agent</span>
+          <span>local-ai-terminal</span>
           <button type="button" data-mission-copy title="Copy terminal output" aria-label="Copy terminal output">
             ${iconSvg("icon-copy")}
           </button>
@@ -690,8 +691,9 @@ function renderMissionTerminal() {
     </div>
   `;
 
-  state.terminal.text = mission.lines.map(stripAnsi).join("\n");
-  openMissionTerminal(mission.lines);
+  const lines = interactiveTerminalBanner(mission);
+  state.terminal.text = "";
+  openMissionTerminal(lines);
 }
 
 function missionStep(label, value, detail) {
@@ -730,8 +732,8 @@ function openMissionTerminal(lines) {
     cols: 92,
     rows: 24,
     convertEol: true,
-    cursorBlink: false,
-    disableStdin: true,
+    cursorBlink: true,
+    disableStdin: false,
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
     fontSize: 12,
     lineHeight: 1.25,
@@ -742,14 +744,102 @@ function openMissionTerminal(lines) {
   state.terminal.instance = terminal;
   state.terminal.container = target;
   fitMissionTerminal();
-  for (const line of lines) terminal.writeln(line);
-  terminal.write("\r\n\x1b[38;5;244m$\x1b[0m ");
+  for (const line of lines) writeTerminalLine(line);
+  terminal.onData(sendTerminalInput);
 
   if (window.ResizeObserver) {
     state.terminal.resizeObserver = new ResizeObserver(() => fitMissionTerminal());
     state.terminal.resizeObserver.observe(target);
   }
-  requestAnimationFrame(() => fitMissionTerminal());
+  connectMissionTerminal();
+  requestAnimationFrame(() => {
+    fitMissionTerminal();
+    sendTerminalResize();
+  });
+}
+
+function interactiveTerminalBanner(mission) {
+  const lines = [
+    "\x1b[1;36mcloudmapper local shell terminal\x1b[0m",
+    "Backed by a local PTY. You can run bash, /bin/sh, codex, claude, and normal shell commands.",
+    "Closing this view terminates the shell process.",
+    "",
+    stepLine("context", `${mission.visibleResources} scoped resources, ${mission.findings.length} findings, ${mission.candidates.length} candidates`),
+  ];
+  if (mission.selected) {
+    lines.push(stepLine("target", `${targetLabel(mission.selected)} score=${mission.selected.score}`, severityAnsi(mission.selected.severity)));
+  }
+  lines.push("");
+  return lines;
+}
+
+function connectMissionTerminal() {
+  const terminal = state.terminal.instance;
+  if (!terminal) return;
+
+  const params = new URLSearchParams({
+    cols: String(terminal.cols),
+    rows: String(terminal.rows),
+  });
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${protocol}//${window.location.host}/api/terminal/pty?${params.toString()}`);
+  state.terminal.socket = socket;
+  state.terminal.socketReady = false;
+  socket.binaryType = "arraybuffer";
+
+  socket.onopen = () => {
+    state.terminal.socketReady = true;
+    writeTerminalLine("\x1b[32mconnected\x1b[0m local shell");
+    sendTerminalResize();
+    terminal.focus();
+  };
+  socket.onmessage = async (event) => {
+    const value = await terminalMessageText(event.data);
+    terminal.write(value);
+    appendTerminalText(stripAnsi(value));
+  };
+  socket.onerror = () => {
+    writeTerminalLine("\x1b[31mterminal websocket error\x1b[0m");
+  };
+  socket.onclose = () => {
+    if (state.terminal.socket === socket) {
+      state.terminal.socket = null;
+      state.terminal.socketReady = false;
+      writeTerminalLine("\x1b[33mterminal closed\x1b[0m");
+    }
+  };
+}
+
+async function terminalMessageText(data) {
+  if (typeof data === "string") return data;
+  const buffer = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
+  return new TextDecoder().decode(buffer);
+}
+
+function sendTerminalInput(data) {
+  const socket = state.terminal.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(new TextEncoder().encode(data));
+}
+
+function sendTerminalResize() {
+  const terminal = state.terminal.instance;
+  const socket = state.terminal.socket;
+  if (!terminal || !socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    kind: "resize",
+    cols: terminal.cols,
+    rows: terminal.rows,
+  }));
+}
+
+function writeTerminalLine(value = "") {
+  state.terminal.instance?.writeln(value);
+  appendTerminalText(`${stripAnsi(value)}\n`);
+}
+
+function appendTerminalText(value) {
+  state.terminal.text = `${state.terminal.text || ""}${value}`;
 }
 
 function missionTerminalTheme() {
@@ -790,10 +880,22 @@ function fitMissionTerminal() {
   if (!bounds.width || !bounds.height) return;
   const cols = Math.max(58, Math.floor((bounds.width - 22) / 7.3));
   const rows = Math.max(10, Math.floor((bounds.height - 18) / 15.5));
-  if (terminal.cols !== cols || terminal.rows !== rows) terminal.resize(cols, rows);
+  if (terminal.cols !== cols || terminal.rows !== rows) {
+    terminal.resize(cols, rows);
+    sendTerminalResize();
+  }
 }
 
 function disposeMissionTerminal() {
+  if (state.terminal.socket) {
+    state.terminal.socket.onopen = null;
+    state.terminal.socket.onmessage = null;
+    state.terminal.socket.onerror = null;
+    state.terminal.socket.onclose = null;
+    state.terminal.socket.close();
+    state.terminal.socket = null;
+    state.terminal.socketReady = false;
+  }
   if (state.terminal.resizeObserver) {
     state.terminal.resizeObserver.disconnect();
     state.terminal.resizeObserver = null;
