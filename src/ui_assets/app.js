@@ -25,6 +25,14 @@ const state = {
     index: 0,
     filtered: [],
   },
+  terminal: {
+    instance: null,
+    resizeObserver: null,
+    container: null,
+    text: "",
+    socket: null,
+    socketReady: false,
+  },
   filters: {
     search: "",
     severity: "",
@@ -49,7 +57,7 @@ const FOCUS_MODE_META = {
   terraform: { label: "Terraform", hint: "3", icon: "icon-managed" },
   blast: { label: "Blast radius", hint: "B", icon: "icon-blast" },
 };
-const VIEW_MODES = ["graph", "exposure", "groups", "attack", "drift", "remediation"];
+const VIEW_MODES = ["graph", "exposure", "groups", "attack", "drift", "remediation", "mission"];
 const VIEW_MODE_META = {
   graph: { label: "Graph", hint: "G", icon: "icon-relation" },
   exposure: { label: "Exposure atlas", hint: "E", icon: "icon-atlas" },
@@ -57,6 +65,7 @@ const VIEW_MODE_META = {
   attack: { label: "Attack paths", hint: "", icon: "icon-attack" },
   drift: { label: "Drift", hint: "", icon: "icon-drift" },
   remediation: { label: "Remediation", hint: "", icon: "icon-remediation" },
+  mission: { label: "Mission terminal", hint: "X", icon: "icon-command" },
 };
 const GROUP_FIELDS = {
   provider: { label: "Provider", filter: "provider", nodeValue: (node) => node.provider || "unknown" },
@@ -379,7 +388,6 @@ function renderGraph(payload) {
     elements,
     minZoom: 0.08,
     maxZoom: 1.35,
-    wheelSensitivity: 0.16,
     style: [
       {
         selector: "node",
@@ -394,7 +402,7 @@ function renderGraph(payload) {
           "border-width": (ele) => ele.data("terraformAddress") || ele.data("severity") ? 2.6 : 1.5,
           "label": "data(label)",
           "font-size": 9,
-          "font-weight": 650,
+          "font-weight": 600,
           "color": theme.nodeLabel,
           "text-wrap": "wrap",
           "text-max-width": 92,
@@ -574,6 +582,7 @@ function renderCurrentView() {
   syncGraphEmptyState();
 
   if (graphActive) {
+    disposeMissionTerminal();
     if (state.cy) {
       applySpreadClasses();
       requestAnimationFrame(() => {
@@ -583,6 +592,12 @@ function renderCurrentView() {
     return;
   }
 
+  if (state.viewMode === "mission") {
+    renderMissionTerminal();
+    return;
+  }
+
+  disposeMissionTerminal();
   if (!state.graph?.nodes?.length) {
     d3Container.innerHTML = emptyState("No scan data", "map.db has no graphable scan.");
     return;
@@ -616,6 +631,392 @@ function renderD3Placeholder(meta) {
       <div class="atlas-placeholder">${iconSvg(meta.icon)}<span>${escapeHtml(meta.label)}</span></div>
     </div>
   `;
+}
+
+function renderMissionTerminal() {
+  const container = $("#d3-view");
+  const mission = buildMissionData();
+  disposeMissionTerminal();
+
+  if (!state.graph?.nodes?.length) {
+    container.innerHTML = emptyState("No scan data", "map.db has no graphable scan.");
+    return;
+  }
+
+  const selected = mission.selected;
+  const target = selected?.node;
+  container.innerHTML = `
+    <div class="mission-split">
+      <section class="mission-stage" aria-label="Mission">
+        <div class="mission-header">
+          <span class="d3-view-title">Local AI Terminal</span>
+          <div class="d3-view-stats">
+            <span><strong>${mission.visibleResources}</strong> scoped</span>
+            <span><strong>${mission.findings.length}</strong> findings</span>
+            <span><strong>${mission.candidates.length}</strong> candidates</span>
+          </div>
+        </div>
+        <div class="mission-flow" aria-label="Mission stages">
+          ${missionStep("Sense", "map.db", "current graph facts")}
+          ${missionStep("Rank", `${mission.candidates.length}`, "risk candidates")}
+          ${missionStep("Decide", selected ? selected.severity : "none", selected ? selected.finding.finding_type : "no target")}
+          ${missionStep("Prove", selected ? `${selected.blastRadius} blast` : "clean", selected ? "before / after" : "no action")}
+        </div>
+        <div class="mission-target">
+          <div class="mission-target-title">${escapeHtml(selected ? targetLabel(selected) : "No target selected")}</div>
+          <div class="mission-target-meta">${escapeHtml(selected ? selected.finding.reason : "Current filters do not expose an actionable finding.")}</div>
+          <div class="kv mission-kv">
+            ${kv("mission", "reduce-public-exposure")}
+            ${kv("score", selected ? selected.score : "n/a")}
+            ${kv("severity", selected ? selected.severity : "n/a")}
+            ${kv("public rules", selected ? selected.publicIngress : 0)}
+            ${kv("blast radius", selected ? selected.blastRadius : 0)}
+            ${kv("terraform", selected ? selected.terraformAddress || "not mapped" : "n/a")}
+            ${kv("resource", target?.id || selected?.finding.aws_uid || "n/a", target?.id || selected?.finding.aws_uid || null)}
+          </div>
+        </div>
+        <div class="mission-candidates">
+          ${mission.candidates.slice(0, 4).map(missionCandidateRow).join("") || `<div class="mission-candidate empty-row">No matching candidates</div>`}
+        </div>
+      </section>
+      <section class="mission-console" aria-label="Terminal">
+        <div class="mission-console-header">
+          <span>local-ai-terminal</span>
+          <button type="button" data-mission-copy title="Copy terminal output" aria-label="Copy terminal output">
+            ${iconSvg("icon-copy")}
+          </button>
+        </div>
+        <div id="mission-terminal" class="mission-terminal"></div>
+      </section>
+    </div>
+  `;
+
+  const lines = interactiveTerminalBanner(mission);
+  state.terminal.text = "";
+  openMissionTerminal(lines);
+}
+
+function missionStep(label, value, detail) {
+  return `
+    <div class="mission-step">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      <small>${escapeHtml(detail)}</small>
+    </div>
+  `;
+}
+
+function missionCandidateRow(candidate) {
+  const node = candidate.node;
+  return `
+    <div class="mission-candidate severity-${escapeHtml(candidate.severity)}">
+      <span class="severity-dot ${escapeHtml(candidate.severity)}" aria-hidden="true"></span>
+      <div>
+        <strong>${escapeHtml(targetLabel(candidate))}</strong>
+        <span>${escapeHtml(node ? `${node.service}/${node.resourceType}` : candidate.finding.finding_type)}</span>
+      </div>
+      <b>${escapeHtml(candidate.score)}</b>
+    </div>
+  `;
+}
+
+function openMissionTerminal(lines) {
+  const target = $("#mission-terminal");
+  if (!target) return;
+  if (!window.Terminal) {
+    target.innerHTML = `<pre>${escapeHtml(lines.map(stripAnsi).join("\n"))}</pre>`;
+    return;
+  }
+
+  const terminal = new Terminal({
+    cols: 92,
+    rows: 24,
+    convertEol: true,
+    cursorBlink: true,
+    disableStdin: false,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    fontSize: 12,
+    lineHeight: 1.25,
+    scrollback: 1200,
+    theme: missionTerminalTheme(),
+  });
+  terminal.open(target);
+  state.terminal.instance = terminal;
+  state.terminal.container = target;
+  fitMissionTerminal();
+  for (const line of lines) writeTerminalLine(line);
+  terminal.onData(sendTerminalInput);
+
+  if (window.ResizeObserver) {
+    state.terminal.resizeObserver = new ResizeObserver(() => fitMissionTerminal());
+    state.terminal.resizeObserver.observe(target);
+  }
+  connectMissionTerminal();
+  requestAnimationFrame(() => {
+    fitMissionTerminal();
+    sendTerminalResize();
+  });
+}
+
+function interactiveTerminalBanner(mission) {
+  const lines = [
+    "\x1b[1;36mcloudmapper local shell terminal\x1b[0m",
+    "Backed by a local PTY. You can run bash, /bin/sh, codex, claude, and normal shell commands.",
+    "Closing this view terminates the shell process.",
+    "",
+    stepLine("context", `${mission.visibleResources} scoped resources, ${mission.findings.length} findings, ${mission.candidates.length} candidates`),
+  ];
+  if (mission.selected) {
+    lines.push(stepLine("target", `${targetLabel(mission.selected)} score=${mission.selected.score}`, severityAnsi(mission.selected.severity)));
+  }
+  lines.push("");
+  return lines;
+}
+
+function connectMissionTerminal() {
+  const terminal = state.terminal.instance;
+  if (!terminal) return;
+
+  const params = new URLSearchParams({
+    cols: String(terminal.cols),
+    rows: String(terminal.rows),
+  });
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${protocol}//${window.location.host}/api/terminal/pty?${params.toString()}`);
+  state.terminal.socket = socket;
+  state.terminal.socketReady = false;
+  socket.binaryType = "arraybuffer";
+
+  socket.onopen = () => {
+    state.terminal.socketReady = true;
+    writeTerminalLine("\x1b[32mconnected\x1b[0m local shell");
+    sendTerminalResize();
+    terminal.focus();
+  };
+  socket.onmessage = async (event) => {
+    const value = await terminalMessageText(event.data);
+    terminal.write(value);
+    appendTerminalText(stripAnsi(value));
+  };
+  socket.onerror = () => {
+    writeTerminalLine("\x1b[31mterminal websocket error\x1b[0m");
+  };
+  socket.onclose = () => {
+    if (state.terminal.socket === socket) {
+      state.terminal.socket = null;
+      state.terminal.socketReady = false;
+      writeTerminalLine("\x1b[33mterminal closed\x1b[0m");
+    }
+  };
+}
+
+async function terminalMessageText(data) {
+  if (typeof data === "string") return data;
+  const buffer = data instanceof ArrayBuffer ? data : await data.arrayBuffer();
+  return new TextDecoder().decode(buffer);
+}
+
+function sendTerminalInput(data) {
+  const socket = state.terminal.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(new TextEncoder().encode(data));
+}
+
+function sendTerminalResize() {
+  const terminal = state.terminal.instance;
+  const socket = state.terminal.socket;
+  if (!terminal || !socket || socket.readyState !== WebSocket.OPEN) return;
+  socket.send(JSON.stringify({
+    kind: "resize",
+    cols: terminal.cols,
+    rows: terminal.rows,
+  }));
+}
+
+function writeTerminalLine(value = "") {
+  state.terminal.instance?.writeln(value);
+  appendTerminalText(`${stripAnsi(value)}\n`);
+}
+
+function appendTerminalText(value) {
+  state.terminal.text = `${state.terminal.text || ""}${value}`;
+}
+
+function missionTerminalTheme() {
+  return state.theme === "light"
+    ? {
+        background: "#0a0a0a",
+        foreground: "#ededed",
+        cursor: "#35d399",
+        selectionBackground: "#334155",
+        black: "#0a0a0a",
+        blue: "#60a5fa",
+        cyan: "#67e8f9",
+        green: "#35d399",
+        red: "#ff5c5c",
+        yellow: "#f5c542",
+        white: "#ededed",
+      }
+    : {
+        background: "#050505",
+        foreground: "#ededed",
+        cursor: "#35d399",
+        selectionBackground: "#334155",
+        black: "#050505",
+        blue: "#60a5fa",
+        cyan: "#67e8f9",
+        green: "#35d399",
+        red: "#ff5c5c",
+        yellow: "#f5c542",
+        white: "#ededed",
+      };
+}
+
+function fitMissionTerminal() {
+  const terminal = state.terminal.instance;
+  const container = state.terminal.container;
+  if (!terminal || !container) return;
+  const bounds = container.getBoundingClientRect();
+  if (!bounds.width || !bounds.height) return;
+  const cols = Math.max(58, Math.floor((bounds.width - 22) / 7.3));
+  const rows = Math.max(10, Math.floor((bounds.height - 18) / 15.5));
+  if (terminal.cols !== cols || terminal.rows !== rows) {
+    terminal.resize(cols, rows);
+    sendTerminalResize();
+  }
+}
+
+function disposeMissionTerminal() {
+  if (state.terminal.socket) {
+    state.terminal.socket.onopen = null;
+    state.terminal.socket.onmessage = null;
+    state.terminal.socket.onerror = null;
+    state.terminal.socket.onclose = null;
+    state.terminal.socket.close();
+    state.terminal.socket = null;
+    state.terminal.socketReady = false;
+  }
+  if (state.terminal.resizeObserver) {
+    state.terminal.resizeObserver.disconnect();
+    state.terminal.resizeObserver = null;
+  }
+  if (state.terminal.instance) {
+    state.terminal.instance.dispose();
+    state.terminal.instance = null;
+  }
+  state.terminal.container = null;
+}
+
+function buildMissionData() {
+  const nodes = currentFilteredNodeData();
+  const findings = filteredFindingList(nodes);
+  const candidates = findings
+    .map(missionCandidate)
+    .sort(compareMissionCandidates);
+  const selected = candidates[0] || null;
+  return {
+    visibleResources: nodes.length,
+    findings,
+    candidates,
+    selected,
+    lines: missionTerminalLines(nodes, findings, candidates, selected),
+  };
+}
+
+function missionCandidate(finding) {
+  const node = finding.aws_uid ? nodeById(finding.aws_uid) : null;
+  const publicIngress = publicIngressRules(finding).length;
+  const blastRadius = (finding.blast_radius || []).length;
+  const terraformAddress = finding.terraform_address || node?.terraformAddress || "";
+  const prod = [node?.environment, node?.namespace, node?.region].filter(Boolean).some((value) => String(value).toLowerCase().includes("prod"));
+  const score =
+    severityRank(finding.severity) * 100 +
+    Math.min(blastRadius, 50) * 2 +
+    publicIngress * 18 +
+    (terraformAddress ? 14 : 0) +
+    (prod ? 12 : 0);
+  return {
+    finding,
+    node,
+    score,
+    severity: finding.severity || "none",
+    publicIngress,
+    blastRadius,
+    terraformAddress,
+    prod,
+  };
+}
+
+function compareMissionCandidates(left, right) {
+  return right.score - left.score || compareFindings(left.finding, right.finding);
+}
+
+function missionTerminalLines(nodes, findings, candidates, selected) {
+  const summary = state.graph?.summary || {};
+  const lines = [];
+  lines.push("\x1b[1;36mcloudmapper mission\x1b[0m reduce-public-exposure");
+  lines.push(`db: ${summary.accountId || "map.db"}   scan: ${summary.scanId || "latest"}`);
+  lines.push("");
+  lines.push("\x1b[38;5;244m$\x1b[0m cloudmapper agent run --mission reduce-public-exposure --mode read-only");
+  lines.push(stepLine("sense", `loaded ${summary.resources || 0} resources, ${summary.relationships || 0} relationships`));
+  lines.push(stepLine("sense", `visible scope has ${nodes.length} resources and ${findings.length} findings`));
+  lines.push(stepLine("rank", `scored ${candidates.length} remediation candidates`));
+
+  if (!selected) {
+    lines.push(stepLine("decide", "no matching public-exposure target in the current scope", "yellow"));
+    lines.push(stepLine("status", "adjust filters or run compare to populate findings", "yellow"));
+    return lines;
+  }
+
+  const top = candidates.slice(0, 3);
+  for (const [index, candidate] of top.entries()) {
+    lines.push(`  ${index + 1}. score=${candidate.score} ${candidate.severity.padEnd(8)} ${targetLabel(candidate)}`);
+  }
+  lines.push(stepLine("decide", `selected ${targetLabel(selected)}`, severityAnsi(selected.severity)));
+  lines.push(stepLine("evidence", selected.finding.reason));
+  lines.push(stepLine("graph", `blast radius before=${selected.blastRadius}; public ingress rules=${selected.publicIngress}`));
+  if (selected.terraformAddress) {
+    lines.push(stepLine("act", `draft Terraform patch for ${selected.terraformAddress}`, "green"));
+  } else {
+    lines.push(stepLine("act", "no Terraform mapping; emit remediation note and import target", "yellow"));
+  }
+  lines.push(stepLine("simulate", `public ingress paths ${Math.max(1, selected.publicIngress)} -> 0 proposed`, "green"));
+  lines.push(stepLine("prove", `preserve graph context for ${selected.blastRadius} downstream resources`));
+  lines.push(stepLine("status", "ready for human review", "green"));
+  return lines;
+}
+
+function stepLine(label, value, tone = "cyan") {
+  return `${ansiTone(tone)}[${label}]\x1b[0m ${value}`;
+}
+
+function ansiTone(tone) {
+  const colors = {
+    cyan: "\x1b[36m",
+    green: "\x1b[32m",
+    red: "\x1b[31m",
+    yellow: "\x1b[33m",
+    critical: "\x1b[31m",
+    high: "\x1b[33m",
+    medium: "\x1b[38;5;214m",
+  };
+  return colors[tone] || colors.cyan;
+}
+
+function severityAnsi(severity) {
+  if (severity === "critical") return "critical";
+  if (severity === "high") return "high";
+  if (severity === "medium") return "medium";
+  return "cyan";
+}
+
+function targetLabel(candidate) {
+  const node = candidate.node;
+  return node?.label || node?.name || candidate.finding.aws_uid || candidate.finding.terraform_address || candidate.finding.id;
+}
+
+function stripAnsi(value) {
+  return String(value).replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
 function renderExposureAtlas() {
@@ -3088,6 +3489,18 @@ function bindControls() {
       button.classList.remove("copied");
     }, 900);
   });
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-mission-copy]");
+    if (!button) return;
+    await copyText(state.terminal.text || "");
+    const originalTitle = button.title;
+    button.title = "Copied";
+    button.classList.add("copied");
+    setTimeout(() => {
+      button.title = originalTitle;
+      button.classList.remove("copied");
+    }, 900);
+  });
   document.addEventListener("click", (event) => {
     const button = event.target.closest(".risk-chip");
     if (!button) return;
@@ -3097,6 +3510,9 @@ function bindControls() {
     const button = event.target.closest("[data-reset-view]");
     if (!button) return;
     resetView();
+  });
+  window.addEventListener("resize", () => {
+    if (state.viewMode === "mission") fitMissionTerminal();
   });
 }
 
@@ -3257,6 +3673,8 @@ function handleKeyboard(event) {
     setViewMode("exposure");
   } else if (event.key.toLowerCase() === "l") {
     setViewMode("groups");
+  } else if (event.key.toLowerCase() === "x") {
+    setViewMode("mission");
   } else if (event.key.toLowerCase() === "t") {
     toggleTheme();
   } else if (event.key === "0") {
