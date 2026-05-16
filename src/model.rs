@@ -82,6 +82,21 @@ pub struct ScanError {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ResourceCost {
+    pub uid: String,
+    pub mode: String,
+    pub source: String,
+    pub currency: String,
+    pub hourly_usd: f64,
+    pub daily_usd: f64,
+    pub monthly_usd: f64,
+    pub confidence: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Manifest {
     pub schema_version: String,
     pub generator: Generator,

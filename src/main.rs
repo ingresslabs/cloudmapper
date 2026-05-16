@@ -1,6 +1,8 @@
 mod agent_export;
 mod aws_scan;
+mod cli_progress;
 mod compare;
+mod cost;
 mod db;
 mod demo;
 mod k8s_demo;
@@ -19,7 +21,11 @@ use tracing_subscriber::FmtSubscriber;
 
 use crate::agent_export::{AgentExportOptions, export_agent_bundle};
 use crate::aws_scan::{ScanOptions, scan_account};
+use crate::cli_progress::IngestAnimation;
 use crate::compare::compare_infra;
+use crate::cost::{
+    CostActualOptions, default_cost_metric, import_actual_costs, write_estimated_costs,
+};
 use crate::demo::write_demo_bundle;
 use crate::k8s_demo::write_k8s_demo_bundle;
 use crate::k8s_scan::{K8sScanOptions, scan_cluster, write_k8s_findings};
@@ -56,6 +62,11 @@ enum Command {
     Terraform {
         #[command(subcommand)]
         command: TerraformCommand,
+    },
+    /// Calculate estimated and actual resource cost overlays.
+    Cost {
+        #[command(subcommand)]
+        command: CostCommand,
     },
     /// Serve a local Cytoscape infrastructure graph UI.
     Ui(UiArgs),
@@ -244,6 +255,56 @@ struct TerraformExportArgs {
     out: Option<PathBuf>,
 }
 
+#[derive(Debug, clap::Subcommand)]
+enum CostCommand {
+    /// Recalculate estimated list-price costs from resources in map.db.
+    Estimate(CostEstimateArgs),
+    /// Import actual billed costs from AWS Cost Explorer and allocation tags.
+    Actual(CostActualArgs),
+}
+
+#[derive(Debug, Parser)]
+struct CostEstimateArgs {
+    /// Map database path.
+    #[arg(long, default_value = "infra/map.db")]
+    db: PathBuf,
+
+    /// AWS scan id. Defaults to the latest scan in the database.
+    #[arg(long)]
+    scan_id: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct CostActualArgs {
+    /// Map database path.
+    #[arg(long, default_value = "infra/map.db")]
+    db: PathBuf,
+
+    /// AWS scan id. Defaults to the latest scan in the database.
+    #[arg(long)]
+    scan_id: Option<String>,
+
+    /// AWS profile name. Falls back to AWS_PROFILE or the default credential chain.
+    #[arg(long)]
+    profile: Option<String>,
+
+    /// Billing API region for Cost Explorer.
+    #[arg(long, default_value = "us-east-1")]
+    billing_region: String,
+
+    /// Number of trailing days to read from Cost Explorer.
+    #[arg(long, default_value_t = 30)]
+    days: i64,
+
+    /// Cost allocation tag key. May be repeated or comma-separated.
+    #[arg(long = "tag", value_delimiter = ',', default_values = ["Environment", "Application", "Owner", "Name"])]
+    tags: Vec<String>,
+
+    /// Cost Explorer metric to import.
+    #[arg(long, default_value_t = default_cost_metric().to_string())]
+    metric: String,
+}
+
 #[derive(Debug, Parser)]
 struct UiArgs {
     /// Map database path.
@@ -298,8 +359,29 @@ async fn run() -> Result<()> {
                     home_region: args.home_region,
                     include_raw: args.include_raw,
                 };
-                let inventory = scan_account(options).await?;
-                write_infra(&args.out, &inventory, args.allow_non_empty_out)?;
+                let progress = IngestAnimation::start("aws", args.out.join("map.db"));
+                progress.stage("discovering AWS resources");
+                let inventory = match scan_account(options).await {
+                    Ok(inventory) => inventory,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.stage("writing bundle and map.db");
+                let scan_id = match write_infra(&args.out, &inventory, args.allow_non_empty_out) {
+                    Ok(scan_id) => scan_id,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.finish(format!(
+                    "{} resources, {} relationships, scan {}",
+                    inventory.resources.len(),
+                    inventory.relationships.len(),
+                    scan_id
+                ));
                 println!(
                     "wrote {} AWS resources, {} relationships, and {} scan errors to {}",
                     inventory.resources.len(),
@@ -313,16 +395,49 @@ async fn run() -> Result<()> {
                 );
             }
             ScanCommand::K8s(args) => {
-                let output = scan_cluster(K8sScanOptions {
+                let scan_options = K8sScanOptions {
                     context: args.context,
                     kubeconfig: args.kubeconfig,
                     namespace: args.namespace,
                     kubectl: args.kubectl,
                     include_raw: args.include_raw,
-                })?;
-                let scan_id = write_infra(&args.out, &output.inventory, args.allow_non_empty_out)?;
-                let findings_run_id =
-                    write_k8s_findings(&args.out.join("map.db"), &scan_id, &output.findings)?;
+                };
+                let progress = IngestAnimation::start("k8s", args.out.join("map.db"));
+                progress.stage("reading Kubernetes API");
+                let output = match scan_cluster(scan_options) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.stage("writing bundle and map.db");
+                let scan_id =
+                    match write_infra(&args.out, &output.inventory, args.allow_non_empty_out) {
+                        Ok(scan_id) => scan_id,
+                        Err(error) => {
+                            progress.fail();
+                            return Err(error);
+                        }
+                    };
+                progress.stage("storing findings");
+                let findings_run_id = match write_k8s_findings(
+                    &args.out.join("map.db"),
+                    &scan_id,
+                    &output.findings,
+                ) {
+                    Ok(run_id) => run_id,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.finish(format!(
+                    "{} resources, {} relationships, {} findings",
+                    output.inventory.resources.len(),
+                    output.inventory.relationships.len(),
+                    output.findings.len()
+                ));
                 println!(
                     "wrote {} Kubernetes resources, {} relationships, {} findings, and {} scan errors to {}",
                     output.inventory.resources.len(),
@@ -340,7 +455,19 @@ async fn run() -> Result<()> {
         },
         Command::Demo(args) => match args.provider {
             DemoProvider::Aws => {
-                let summary = write_demo_bundle(&args.out, args.allow_non_empty_out)?;
+                let progress = IngestAnimation::start("demo aws", args.out.join("map.db"));
+                progress.stage("generating demo cloud inventory");
+                let summary = match write_demo_bundle(&args.out, args.allow_non_empty_out) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.finish(format!(
+                    "{} resources, {} relationships, {} findings",
+                    summary.resources, summary.relationships, summary.findings
+                ));
                 println!(
                     "wrote AWS large-org demo bundle with {} resources, {} relationships, and {} findings to {}",
                     summary.resources,
@@ -360,7 +487,19 @@ async fn run() -> Result<()> {
                 );
             }
             DemoProvider::K8s => {
-                let summary = write_k8s_demo_bundle(&args.out, args.allow_non_empty_out)?;
+                let progress = IngestAnimation::start("demo k8s", args.out.join("map.db"));
+                progress.stage("generating demo cluster inventory");
+                let summary = match write_k8s_demo_bundle(&args.out, args.allow_non_empty_out) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.finish(format!(
+                    "{} resources, {} relationships, {} findings",
+                    summary.resources, summary.relationships, summary.findings
+                ));
                 println!(
                     "wrote Kubernetes platform demo bundle with {} resources, {} relationships, and {} findings to {}",
                     summary.resources,
@@ -460,6 +599,51 @@ async fn run() -> Result<()> {
                 }
             }
         },
+        Command::Cost { command } => match command {
+            CostCommand::Estimate(args) => {
+                let summary = write_estimated_costs(&args.db, args.scan_id.as_deref())?;
+                println!(
+                    "wrote estimated list-price costs for {}/{} resources in {} ({:.2} USD/month)",
+                    summary.costed_resources,
+                    summary.resources,
+                    summary.scan_id,
+                    summary.monthly_usd
+                );
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    args.db.display()
+                );
+            }
+            CostCommand::Actual(args) => {
+                let summary = import_actual_costs(CostActualOptions {
+                    db: args.db.clone(),
+                    scan_id: args.scan_id,
+                    profile: args.profile,
+                    billing_region: args.billing_region,
+                    days: args.days,
+                    tags: args.tags,
+                    metric: args.metric,
+                })
+                .await?;
+                println!(
+                    "wrote actual Cost Explorer cost overlay for {}/{} resources in {} ({:.2} USD/month run rate)",
+                    summary.costed_resources,
+                    summary.resources,
+                    summary.scan_id,
+                    summary.monthly_usd
+                );
+                println!(
+                    "period: {} to {} grouped by tags: {}",
+                    summary.period_start,
+                    summary.period_end,
+                    summary.tags.join(", ")
+                );
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    args.db.display()
+                );
+            }
+        },
         Command::Ui(args) => {
             serve_ui(&args.db, &args.bind)?;
         }
@@ -489,23 +673,30 @@ fn format_cli_error(error: &Error) -> String {
     }
     lines.push(format!("hint: {}", classification.hint));
 
-    let details = dedup_details(&chain)
-        .into_iter()
-        .filter(|detail| Some(detail) != context.as_ref())
-        .collect::<Vec<_>>();
-    if !details.is_empty() {
-        lines.push("details:".to_string());
-        for detail in details.into_iter().take(4) {
-            lines.push(format!("  - {detail}"));
-        }
+    if classification.show_details {
+        let details = dedup_details(&chain)
+            .into_iter()
+            .filter(|detail| Some(detail) != context.as_ref())
+            .collect::<Vec<_>>();
+        append_details(&mut lines, details);
     }
 
     lines.join("\n")
 }
 
+fn append_details(lines: &mut Vec<String>, details: Vec<String>) {
+    if !details.is_empty() {
+        lines.push("details:".to_string());
+        for detail in details.into_iter().take(4) {
+            lines.push(format!("  - {}", shorten_detail(&detail)));
+        }
+    }
+}
+
 struct ErrorClassification {
     summary: &'static str,
     hint: &'static str,
+    show_details: bool,
 }
 
 fn classify_error(text: &str) -> ErrorClassification {
@@ -515,14 +706,20 @@ fn classify_error(text: &str) -> ErrorClassification {
     {
         return ErrorClassification {
             summary: "AWS credentials are expired",
-            hint: "refresh AWS credentials and retry; for AWS SSO run `aws sso login`, or pass `--profile <name>` for a valid profile",
+            hint: "for SSO, run `aws sso login --profile <name>` for the same profile\n      if SSO config is missing, run `aws configure sso --profile <name>` first",
+            show_details: false,
         };
     }
 
-    if text.contains("no credentials") || text.contains("failed to load credentials") {
+    if text.contains("no credentials")
+        || text.contains("failed to load credentials")
+        || text.contains("no providers in chain provided credentials")
+        || text.contains("credential provider was not enabled")
+    {
         return ErrorClassification {
             summary: "AWS credentials are not available",
             hint: "configure AWS credentials, set AWS_PROFILE, or pass `--profile <name>`",
+            show_details: false,
         };
     }
 
@@ -530,12 +727,14 @@ fn classify_error(text: &str) -> ErrorClassification {
         return ErrorClassification {
             summary: "AWS API access was denied",
             hint: "check the selected AWS profile and IAM permissions for the requested scan",
+            show_details: true,
         };
     }
 
     ErrorClassification {
         summary: "command failed",
         hint: "rerun with a valid input path, database, or AWS profile depending on the command context",
+        show_details: true,
     }
 }
 
@@ -565,10 +764,25 @@ fn dedup_details(chain: &[String]) -> Vec<String> {
 }
 
 fn is_low_signal_detail(cause: &str) -> bool {
+    let lower = cause.to_lowercase();
     matches!(
         cause,
         "dispatch failure" | "other" | "an error occurred while loading credentials"
     ) || cause.starts_with("AccessDeniedException: AccessDeniedException")
+        || lower.contains("providererror(")
+        || lower.contains("aws_request_id")
+}
+
+fn shorten_detail(detail: &str) -> String {
+    const MAX_DETAIL_LEN: usize = 240;
+
+    let mut chars = detail.chars();
+    let shortened = chars.by_ref().take(MAX_DETAIL_LEN).collect::<String>();
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else {
+        shortened
+    }
 }
 
 #[cfg(test)]
@@ -587,8 +801,28 @@ mod tests {
 
         assert!(formatted.contains("cloudmapper error: AWS credentials are expired"));
         assert!(formatted.contains("context: calling sts:GetCallerIdentity"));
-        assert!(formatted.contains("aws sso login"));
+        assert!(formatted.contains("aws sso login --profile <name>"));
+        assert!(formatted.contains("aws configure sso --profile <name>"));
+        assert!(!formatted.contains("details:"));
         assert!(!formatted.contains("Caused by:"));
+    }
+
+    #[test]
+    fn hides_repeated_aws_sdk_provider_chain_for_expired_sso() {
+        let error = anyhow!(
+            "AccessDeniedException: The refresh token has expired. (ProviderError(ProviderError {{ source: RefreshFailed, aws_request_id: abc }}))"
+        )
+        .context("failed to refresh cached Login token: Your session has expired.")
+        .context("an error occurred while loading credentials")
+        .context("dispatch failure")
+        .context("calling sts:GetCallerIdentity");
+
+        let formatted = format_cli_error(&error);
+
+        assert_eq!(
+            formatted,
+            "cloudmapper error: AWS credentials are expired\ncontext: calling sts:GetCallerIdentity\nhint: for SSO, run `aws sso login --profile <name>` for the same profile\n      if SSO config is missing, run `aws configure sso --profile <name>` first"
+        );
     }
 
     #[test]
@@ -600,5 +834,19 @@ mod tests {
         assert!(formatted.contains("cloudmapper error: command failed"));
         assert!(formatted.contains("context: reading Terraform state terraform.tfstate"));
         assert!(formatted.contains("details:"));
+    }
+
+    #[test]
+    fn formats_missing_aws_credentials_as_actionable_error() {
+        let error = anyhow!("the credential provider was not enabled")
+            .context("no providers in chain provided credentials")
+            .context("calling sts:GetCallerIdentity");
+
+        let formatted = format_cli_error(&error);
+
+        assert_eq!(
+            formatted,
+            "cloudmapper error: AWS credentials are not available\ncontext: calling sts:GetCallerIdentity\nhint: configure AWS credentials, set AWS_PROFILE, or pass `--profile <name>`"
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "cloudmapper"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "AWS infrastructure inventory exporter for agent-readable JSON and graph artifacts"
 repository = "https://github.com/ingresslabs/cloudmapper"
@@ -10,6 +10,7 @@ rust-version = "1.85"
 [dependencies]
 anyhow = "1.0.102"
 aws-config = { version = "1.8.16", features = ["credentials-login"] }
+aws-sdk-costexplorer = "=1.80.0"
 aws-sdk-ec2 = "1.226.0"
 aws-sdk-iam = "1.108.1"
 aws-sdk-lambda = "1.122.0"

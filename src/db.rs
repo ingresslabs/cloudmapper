@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::model::Inventory;
+use crate::model::{Inventory, ResourceCost};
 
 pub fn open_cloudmapper_db(path: &Path) -> Result<Connection> {
     ensure_parent_dir(path)?;
@@ -73,6 +73,22 @@ pub fn init_schema(connection: &Connection) -> Result<()> {
               FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS resource_costs (
+              scan_id TEXT NOT NULL,
+              uid TEXT NOT NULL,
+              mode TEXT NOT NULL,
+              source TEXT NOT NULL,
+              currency TEXT NOT NULL,
+              hourly_usd REAL NOT NULL,
+              daily_usd REAL NOT NULL,
+              monthly_usd REAL NOT NULL,
+              confidence TEXT NOT NULL,
+              notes_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (scan_id, uid, mode),
+              FOREIGN KEY (scan_id, uid) REFERENCES resources(scan_id, uid) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS terraform_states (
               state_id TEXT PRIMARY KEY,
               source_path TEXT NOT NULL,
@@ -138,8 +154,10 @@ pub fn init_schema(connection: &Connection) -> Result<()> {
               ON findings(run_id, finding_type);
             CREATE INDEX IF NOT EXISTS idx_findings_aws_uid
               ON findings(run_id, aws_uid);
+            CREATE INDEX IF NOT EXISTS idx_resource_costs_mode
+              ON resource_costs(scan_id, mode);
 
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             "#,
         )
         .context("initializing cloudmapper map schema")?;
@@ -244,8 +262,28 @@ pub fn write_inventory_db(path: &Path, inventory: &Inventory) -> Result<String> 
         }
     }
 
+    let estimated_costs = inventory
+        .resources
+        .iter()
+        .filter_map(crate::cost::estimate_resource_cost)
+        .collect::<Vec<_>>();
+    insert_resource_costs(&transaction, &scan_id, "estimated", &estimated_costs)?;
+
     transaction.commit()?;
     Ok(scan_id)
+}
+
+pub fn replace_resource_costs(
+    path: &Path,
+    scan_id: &str,
+    mode: &str,
+    costs: &[ResourceCost],
+) -> Result<()> {
+    let mut connection = open_cloudmapper_db(path)?;
+    let transaction = connection.transaction()?;
+    insert_resource_costs(&transaction, scan_id, mode, costs)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 pub fn latest_terraform_state_id(connection: &Connection) -> Result<Option<String>> {
@@ -287,6 +325,43 @@ fn optional_json(value: &Option<serde_json::Value>) -> Result<Option<String>> {
         .map(serde_json::to_string)
         .transpose()
         .context("serializing optional JSON value")
+}
+
+fn insert_resource_costs(
+    transaction: &rusqlite::Transaction<'_>,
+    scan_id: &str,
+    mode: &str,
+    costs: &[ResourceCost],
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM resource_costs WHERE scan_id = ?1 AND mode = ?2",
+        params![scan_id, mode],
+    )?;
+    let mut statement = transaction.prepare(
+        r#"
+        INSERT INTO resource_costs (
+          scan_id, uid, mode, source, currency, hourly_usd, daily_usd, monthly_usd,
+          confidence, notes_json, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        "#,
+    )?;
+    for cost in costs {
+        statement.execute(params![
+            scan_id,
+            cost.uid,
+            cost.mode,
+            cost.source,
+            cost.currency,
+            cost.hourly_usd,
+            cost.daily_usd,
+            cost.monthly_usd,
+            cost.confidence,
+            serde_json::to_string(&cost.notes)?,
+            cost.updated_at.to_rfc3339(),
+        ])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -334,10 +409,18 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let cost_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM resource_costs WHERE scan_id = ?1 AND mode = 'estimated'",
+                params![scan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert_eq!(resources, 1);
         assert_eq!(relationships, 1);
         assert_eq!(errors, 1);
+        assert_eq!(cost_rows, 1);
     }
 
     pub fn sample_inventory() -> Inventory {

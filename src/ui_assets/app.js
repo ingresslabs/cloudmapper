@@ -4,6 +4,7 @@ const state = {
   findingsRunId: null,
   cy: null,
   viewMode: "graph",
+  costMode: "off",
   groupBy: "environment",
   theme: "light",
   spreadMode: false,
@@ -24,6 +25,15 @@ const state = {
     open: false,
     index: 0,
     filtered: [],
+  },
+  costMax: {
+    estimated: 0,
+    actual: 0,
+  },
+  costAnalytics: {
+    source: "estimated",
+    basis: "month",
+    groupBy: "service",
   },
   terminal: {
     instance: null,
@@ -57,11 +67,12 @@ const FOCUS_MODE_META = {
   terraform: { label: "Terraform", hint: "3", icon: "icon-managed" },
   blast: { label: "Blast radius", hint: "B", icon: "icon-blast" },
 };
-const VIEW_MODES = ["graph", "exposure", "groups", "attack", "drift", "remediation", "mission"];
+const VIEW_MODES = ["graph", "exposure", "groups", "cost", "attack", "drift", "remediation", "mission"];
 const VIEW_MODE_META = {
   graph: { label: "Graph", hint: "G", icon: "icon-relation" },
   exposure: { label: "Exposure atlas", hint: "E", icon: "icon-atlas" },
   groups: { label: "Groups", hint: "L", icon: "icon-all" },
+  cost: { label: "Cost analytics", hint: "C", icon: "icon-cost" },
   attack: { label: "Attack paths", hint: "", icon: "icon-attack" },
   drift: { label: "Drift", hint: "", icon: "icon-drift" },
   remediation: { label: "Remediation", hint: "", icon: "icon-remediation" },
@@ -76,6 +87,30 @@ const GROUP_FIELDS = {
   severity: { label: "Severity", filter: "severity", nodeValue: (node) => node.severity || "none" },
   relationshipType: { label: "Relationship type", filter: null },
 };
+const COST_MODES = ["off", "estimated", "actual"];
+const COST_MODE_META = {
+  off: { label: "Cost overlay off", icon: "icon-cost" },
+  estimated: { label: "Estimated list-price cost", icon: "icon-cost" },
+  actual: { label: "Actual billed cost", icon: "icon-cost" },
+};
+const COST_ANALYTICS_SOURCES = {
+  estimated: { label: "Estimated", title: "Estimated list-price run rate" },
+  actual: { label: "Actual", title: "Actual billed run rate" },
+  delta: { label: "Delta", title: "Actual minus estimated" },
+};
+const COST_BASIS = {
+  hour: { label: "Hour", suffix: "/h", key: "hourlyUsd" },
+  day: { label: "Day", suffix: "/d", key: "dailyUsd" },
+  month: { label: "Month", suffix: "/mo", key: "monthlyUsd" },
+};
+const COST_GROUP_FIELDS = {
+  service: { label: "Service", nodeValue: (node) => node.service || "unknown" },
+  environment: { label: "Environment", nodeValue: (node) => node.environment || "untagged" },
+  application: { label: "Application", nodeValue: (node) => node.application || "unassigned" },
+  owner: { label: "Owner", nodeValue: (node) => node.owner || "unowned" },
+  region: { label: "Region", nodeValue: (node) => node.region || "global" },
+};
+const COST_PALETTE = ["#0ea5e9", "#22c55e", "#f59e0b", "#a855f7", "#ef4444", "#14b8a6", "#eab308", "#64748b", "#ec4899", "#84cc16"];
 const THEME_STORAGE_KEY = "cloudmapper.theme";
 const SEVERITY_META = {
   critical: { rank: 4, label: "critical", color: "#ff5c5c", soft: "#2a1111" },
@@ -138,6 +173,8 @@ function graphTheme() {
     nodeLabelBg: cssVar("--node-label-bg", "#050505"),
     edge: cssVar("--edge", "#4b5563"),
     overlay: cssVar("--overlay", "#fafafa"),
+    cost: cssVar("--cost", "#0ea5e9"),
+    costHigh: cssVar("--cost-high", "#0284c7"),
     critical: cssVar("--critical", "#ff5c5c"),
     high: cssVar("--high", "#ff8a3d"),
     medium: cssVar("--medium", "#f5c542"),
@@ -168,7 +205,29 @@ function nodeShellColor(data) {
   return serviceColor(data.service);
 }
 
+function activeNodeCost(data, mode = state.costMode) {
+  if (!mode || mode === "off") return null;
+  const cost = data.cost?.[mode];
+  return cost && Number(cost.monthlyUsd) > 0 ? cost : null;
+}
+
+function costIntensity(data) {
+  const cost = activeNodeCost(data);
+  if (!cost) return 0;
+  const max = state.costMax[state.costMode] || 0;
+  if (max <= 0) return 0;
+  return Math.max(0.08, Math.min(1, Math.sqrt(Number(cost.monthlyUsd) / max)));
+}
+
+function costRingColor(data, theme = graphTheme()) {
+  const intensity = costIntensity(data);
+  if (!intensity) return null;
+  return intensity > 0.66 ? theme.costHigh : theme.cost;
+}
+
 function nodeRingColor(data, theme = graphTheme()) {
+  const costColor = costRingColor(data, theme);
+  if (costColor) return costColor;
   if (data.severity === "critical") return theme.critical;
   if (data.severity === "high") return theme.high;
   if (data.severity === "medium") return theme.medium;
@@ -185,6 +244,8 @@ function nodeIconColor(data, theme = graphTheme()) {
 }
 
 function nodeSize(data) {
+  const intensity = costIntensity(data);
+  if (intensity) return Math.max(32, Math.round(30 + intensity * 24));
   if (data.severity === "critical") return 38;
   if (data.severity === "high") return 34;
   if (data.severity === "medium") return 32;
@@ -361,6 +422,8 @@ function renderGraph(payload) {
 
   populateServices(payload.summary.serviceCounts || []);
   populateFacets(payload.nodes || []);
+  updateCostBounds(payload.nodes || []);
+  syncCostControl();
   updateSummary(payload.summary);
   renderRiskSummary((payload.nodes || []).map((node) => node.data));
 
@@ -399,7 +462,7 @@ function renderGraph(payload) {
           "background-height": (ele) => nodeIconSize(ele.data()),
           "background-opacity": 1,
           "border-color": (ele) => nodeRingColor(ele.data(), theme),
-          "border-width": (ele) => ele.data("terraformAddress") || ele.data("severity") ? 2.6 : 1.5,
+          "border-width": (ele) => activeNodeCost(ele.data()) ? 4.2 : (ele.data("terraformAddress") || ele.data("severity") ? 2.6 : 1.5),
           "label": "data(label)",
           "font-size": 9,
           "font-weight": 600,
@@ -540,9 +603,31 @@ function updateSummary(summary) {
   $("#metric-edges").textContent = summary.relationships || 0;
   $("#metric-managed").textContent = summary.managedResources || 0;
   $("#metric-risk").textContent = (summary.criticalFindings || 0) + (summary.highFindings || 0);
+  updateCostMetric(summary);
   $("#graph-subtitle").textContent = summary.scanId ? shortText(summary.scanId, 34) : "no scan";
   $("#db-line").textContent = summary.accountId || "map.db";
   $("#scan-line").textContent = summary.collectedAt ? formatDate(summary.collectedAt) : "no scan";
+}
+
+function updateCostBounds(nodes) {
+  state.costMax = { estimated: 0, actual: 0 };
+  for (const node of nodes) {
+    for (const mode of ["estimated", "actual"]) {
+      const monthly = Number(node.data?.cost?.[mode]?.monthlyUsd || 0);
+      if (monthly > state.costMax[mode]) state.costMax[mode] = monthly;
+    }
+  }
+}
+
+function updateCostMetric(summary = state.graph?.summary || {}) {
+  const metric = $("#metric-cost");
+  const wrapper = metric?.closest("span");
+  if (!metric || !wrapper) return;
+  const mode = state.costMode === "actual" ? "actual" : "estimated";
+  const totals = summary.cost?.[mode] || {};
+  metric.textContent = formatCompactMoney(totals.monthlyUsd || 0);
+  wrapper.title = `${COST_MODE_META[mode].label}: ${formatMoney(totals.monthlyUsd || 0)}/mo`;
+  wrapper.classList.toggle("active", state.costMode !== "off");
 }
 
 function updateVisibleCount(visible, total) {
@@ -617,6 +702,10 @@ function renderCurrentView() {
   }
   if (state.viewMode === "groups") {
     renderGroupLanes();
+    return;
+  }
+  if (state.viewMode === "cost") {
+    renderCostAnalytics();
     return;
   }
   renderD3Placeholder(VIEW_MODE_META[state.viewMode] || VIEW_MODE_META.graph);
@@ -2123,6 +2212,586 @@ function renderGroupLanes() {
   });
 }
 
+function renderCostAnalytics() {
+  const container = $("#d3-view");
+  const model = buildCostAnalyticsData();
+  const sourceOptions = Object.entries(COST_ANALYTICS_SOURCES)
+    .map(([key, meta]) => `<option value="${escapeHtml(key)}"${key === model.source ? " selected" : ""}>${escapeHtml(meta.label)}</option>`)
+    .join("");
+  const basisOptions = Object.entries(COST_BASIS)
+    .map(([key, meta]) => `<option value="${escapeHtml(key)}"${key === model.basis ? " selected" : ""}>${escapeHtml(meta.label)}</option>`)
+    .join("");
+  const groupOptions = Object.entries(COST_GROUP_FIELDS)
+    .map(([key, meta]) => `<option value="${escapeHtml(key)}"${key === model.groupBy ? " selected" : ""}>${escapeHtml(meta.label)}</option>`)
+    .join("");
+
+  if (!model.visibleResources) {
+    container.innerHTML = emptyState("No matching resources", "Current filters hide every resource.");
+    return;
+  }
+
+  container.innerHTML = `
+    <div class="d3-layer cost-analytics">
+      <div class="d3-view-header cost-view-header">
+        <span class="d3-view-title">Cost Analytics</span>
+        <label class="cost-control">
+          <span>Source</span>
+          <select id="cost-source-view" aria-label="Cost source">${sourceOptions}</select>
+        </label>
+        <label class="cost-control">
+          <span>Basis</span>
+          <select id="cost-basis-view" aria-label="Cost basis">${basisOptions}</select>
+        </label>
+        <label class="cost-control">
+          <span>Group</span>
+          <select id="cost-group-view" aria-label="Cost group">${groupOptions}</select>
+        </label>
+        <div class="d3-view-stats">
+          <span><strong>${escapeHtml(costValueLabel(model.totalValue, model.basis, model.source === "delta"))}</strong>${escapeHtml(COST_ANALYTICS_SOURCES[model.source].label.toLowerCase())}</span>
+          <span><strong>${model.costedResources}</strong> costed</span>
+          <span><strong>${model.coveragePct}%</strong> coverage</span>
+          <span><strong>${model.groups.length}</strong> groups</span>
+        </div>
+      </div>
+      ${model.rows.length ? `
+        <div class="cost-analytics-grid">
+          <section class="cost-panel cost-summary-panel">
+            ${costSummaryCard("Visible", model.visibleResources, "resources")}
+            ${costSummaryCard("Costed", model.costedResources, `${model.coveragePct}% coverage`)}
+            ${costSummaryCard("Estimated", costValueLabel(model.estimatedTotal, model.basis), "run rate")}
+            ${costSummaryCard("Actual", costValueLabel(model.actualTotal, model.basis), model.actualResources ? "tag allocation" : "not imported")}
+          </section>
+          <section class="cost-panel cost-panel-treemap">
+            <div class="cost-panel-head">
+              <span>Spend map</span>
+              <small>${escapeHtml(COST_GROUP_FIELDS[model.groupBy].label)}</small>
+            </div>
+            <div id="cost-treemap-stage" class="cost-d3-stage"></div>
+          </section>
+          <section class="cost-panel">
+            <div class="cost-panel-head">
+              <span>Top resources</span>
+              <small>${escapeHtml(COST_BASIS[model.basis].suffix)}</small>
+            </div>
+            <div id="cost-bars-stage" class="cost-d3-stage"></div>
+          </section>
+          <section class="cost-panel">
+            <div class="cost-panel-head">
+              <span>Cost vs risk</span>
+              <small>monthly normalized risk</small>
+            </div>
+            <div id="cost-scatter-stage" class="cost-d3-stage"></div>
+          </section>
+          <section class="cost-panel">
+            <div class="cost-panel-head">
+              <span>Estimate vs actual</span>
+              <small>${escapeHtml(costValueLabel(model.deltaTotal, model.basis, true))}</small>
+            </div>
+            <div id="cost-delta-stage" class="cost-d3-stage"></div>
+          </section>
+        </div>
+      ` : emptyState("No cost data", `${COST_ANALYTICS_SOURCES[model.source].title} is not available for the current filters.`)}
+    </div>
+  `;
+
+  $("#cost-source-view")?.addEventListener("change", (event) => {
+    state.costAnalytics.source = event.target.value;
+    renderCurrentView();
+    updateUrlFromFilters();
+  });
+  $("#cost-basis-view")?.addEventListener("change", (event) => {
+    state.costAnalytics.basis = event.target.value;
+    renderCurrentView();
+    updateUrlFromFilters();
+  });
+  $("#cost-group-view")?.addEventListener("change", (event) => {
+    state.costAnalytics.groupBy = event.target.value;
+    renderCurrentView();
+    updateUrlFromFilters();
+  });
+
+  if (!model.rows.length) return;
+  renderCostTreemap(model);
+  renderCostBars(model);
+  renderCostScatter(model);
+  renderCostDelta(model);
+}
+
+function costSummaryCard(label, value, detail) {
+  return `
+    <div class="cost-summary-card">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(String(value))}</strong>
+      <small>${escapeHtml(detail)}</small>
+    </div>
+  `;
+}
+
+function buildCostAnalyticsData() {
+  const source = COST_ANALYTICS_SOURCES[state.costAnalytics.source] ? state.costAnalytics.source : "estimated";
+  const basis = COST_BASIS[state.costAnalytics.basis] ? state.costAnalytics.basis : "month";
+  const groupBy = COST_GROUP_FIELDS[state.costAnalytics.groupBy] ? state.costAnalytics.groupBy : "service";
+  const nodes = currentFilteredNodeData();
+  const basisKey = COST_BASIS[basis].key;
+  const rows = [];
+  let estimatedTotal = 0;
+  let actualTotal = 0;
+  let estimatedResources = 0;
+  let actualResources = 0;
+
+  for (const node of nodes) {
+    const estimated = costAmount(node.cost?.estimated, basisKey);
+    const actual = costAmount(node.cost?.actual, basisKey);
+    if (estimated !== null) {
+      estimatedTotal += estimated;
+      estimatedResources += 1;
+    }
+    if (actual !== null) {
+      actualTotal += actual;
+      actualResources += 1;
+    }
+
+    let value = null;
+    if (source === "delta") {
+      if (estimated === null && actual === null) continue;
+      value = (actual || 0) - (estimated || 0);
+      if (Math.abs(value) < 0.005) continue;
+    } else {
+      value = source === "actual" ? actual : estimated;
+      if (value === null || value <= 0) continue;
+    }
+
+    rows.push({
+      id: node.id,
+      label: node.label || node.id,
+      node,
+      service: node.service || "unknown",
+      environment: node.environment || "untagged",
+      application: node.application || "unassigned",
+      owner: node.owner || "unowned",
+      region: node.region || "global",
+      resourceType: node.resourceType || "resource",
+      severity: node.severity || "none",
+      value,
+      magnitude: Math.abs(value),
+      estimated: estimated || 0,
+      actual: actual || 0,
+    });
+  }
+
+  const groups = aggregateCostGroups(rows, groupBy);
+  const totalValue = source === "delta"
+    ? rows.reduce((sum, row) => sum + row.value, 0)
+    : rows.reduce((sum, row) => sum + row.magnitude, 0);
+  const deltaTotal = actualTotal - estimatedTotal;
+  return {
+    source,
+    basis,
+    groupBy,
+    rows,
+    groups,
+    visibleResources: nodes.length,
+    costedResources: rows.length,
+    estimatedResources,
+    actualResources,
+    estimatedTotal,
+    actualTotal,
+    deltaTotal,
+    totalValue,
+    coveragePct: nodes.length ? Math.round(rows.length / nodes.length * 100) : 0,
+  };
+}
+
+function aggregateCostGroups(rows, groupBy) {
+  const meta = COST_GROUP_FIELDS[groupBy] || COST_GROUP_FIELDS.service;
+  const groups = new Map();
+  for (const row of rows) {
+    const value = meta.nodeValue(row.node);
+    const key = `${groupBy}:${value}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        label: value,
+        groupBy,
+        resources: 0,
+        nodeIds: [],
+        value: 0,
+        magnitude: 0,
+        estimated: 0,
+        actual: 0,
+        maxSeverity: "none",
+        services: new Set(),
+        rows: [],
+      });
+    }
+    const group = groups.get(key);
+    group.resources += 1;
+    group.nodeIds.push(row.id);
+    group.value += row.value;
+    group.magnitude += row.magnitude;
+    group.estimated += row.estimated;
+    group.actual += row.actual;
+    group.services.add(row.service);
+    group.maxSeverity = maxSeverityName(group.maxSeverity, row.severity);
+    group.rows.push(row);
+  }
+  return [...groups.values()].sort((left, right) => right.magnitude - left.magnitude || left.label.localeCompare(right.label));
+}
+
+function costAmount(cost, basisKey) {
+  if (!cost) return null;
+  const value = Number(cost[basisKey] ?? 0);
+  return Number.isFinite(value) ? value : null;
+}
+
+function renderCostTreemap(model) {
+  const stage = $("#cost-treemap-stage");
+  if (!stage || !model.groups.length) return;
+  const { width, height } = costStageSize(stage, 520, 310);
+  const root = d3.hierarchy({ children: model.groups.slice(0, 28) })
+    .sum((group) => Math.max(Number(group.magnitude || 0), 0.01))
+    .sort((left, right) => right.value - left.value);
+  d3.treemap()
+    .size([width, height])
+    .paddingInner(5)
+    .round(true)(root);
+
+  const svg = costSvg(stage, width, height, "Cost treemap");
+  const leaf = svg.selectAll("g")
+    .data(root.leaves())
+    .join("g")
+    .attr("class", "cost-treemap-cell")
+    .attr("transform", (item) => `translate(${item.x0},${item.y0})`)
+    .on("click", (_event, item) => selectCostGroup(item.data, model));
+
+  leaf.append("title")
+    .text((item) => costGroupTitle(item.data, model));
+
+  leaf.append("clipPath")
+    .attr("id", (_item, index) => `cost-treemap-clip-${index}`)
+    .append("rect")
+    .attr("x", 1)
+    .attr("y", 1)
+    .attr("width", (item) => Math.max(0, item.x1 - item.x0 - 2))
+    .attr("height", (item) => Math.max(0, item.y1 - item.y0 - 2));
+
+  leaf.append("rect")
+    .attr("width", (item) => Math.max(0, item.x1 - item.x0))
+    .attr("height", (item) => Math.max(0, item.y1 - item.y0))
+    .attr("rx", 7)
+    .attr("fill", (item, index) => costColor(index, item.data, model))
+    .attr("opacity", (item) => model.source === "delta" && item.data.value < 0 ? 0.62 : 0.88);
+
+  leaf.append("text")
+    .attr("class", "cost-treemap-title")
+    .attr("clip-path", (_item, index) => `url(#cost-treemap-clip-${index})`)
+    .attr("x", 9)
+    .attr("y", 18)
+    .style("display", (item) => costTreemapCanShow(item, "title") ? null : "none")
+    .each(function(item) {
+      fitSvgText(this, item.data.label, item.x1 - item.x0 - 18);
+    });
+
+  leaf.append("text")
+    .attr("class", "cost-treemap-value")
+    .attr("clip-path", (_item, index) => `url(#cost-treemap-clip-${index})`)
+    .attr("x", 9)
+    .attr("y", 36)
+    .style("display", (item) => costTreemapCanShow(item, "value") ? null : "none")
+    .each(function(item) {
+      fitSvgText(this, costValueLabel(item.data.value, model.basis, model.source === "delta"), item.x1 - item.x0 - 18);
+    });
+}
+
+function costTreemapCanShow(item, line) {
+  const width = item.x1 - item.x0;
+  const height = item.y1 - item.y0;
+  if (line === "value") return width >= 86 && height >= 50;
+  return width >= 70 && height >= 30;
+}
+
+function fitSvgText(element, value, maxWidth) {
+  const full = String(value || "");
+  if (!full || maxWidth < 18) {
+    element.textContent = "";
+    return;
+  }
+  element.textContent = full;
+  if (element.getComputedTextLength() <= maxWidth) return;
+
+  const suffix = "...";
+  element.textContent = suffix;
+  if (element.getComputedTextLength() > maxWidth) {
+    element.textContent = "";
+    return;
+  }
+
+  let low = 0;
+  let high = full.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    element.textContent = `${full.slice(0, mid)}${suffix}`;
+    if (element.getComputedTextLength() <= maxWidth) low = mid;
+    else high = mid - 1;
+  }
+  element.textContent = low ? `${full.slice(0, low)}${suffix}` : "";
+}
+
+function renderCostBars(model) {
+  const stage = $("#cost-bars-stage");
+  if (!stage) return;
+  const rows = [...model.rows].sort((left, right) => right.magnitude - left.magnitude).slice(0, 14);
+  if (!rows.length) return;
+  const { width, height } = costStageSize(stage, 520, 320);
+  const margin = { top: 12, right: 22, bottom: 22, left: 132 };
+  const innerWidth = Math.max(180, width - margin.left - margin.right);
+  const innerHeight = Math.max(180, height - margin.top - margin.bottom);
+  const x = d3.scaleLinear()
+    .domain([0, d3.max(rows, (row) => row.magnitude) || 1])
+    .range([0, innerWidth]);
+  const y = d3.scaleBand()
+    .domain(rows.map((row) => row.id))
+    .range([0, innerHeight])
+    .padding(0.24);
+  const svg = costSvg(stage, width, height, "Top cost resources");
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+  g.selectAll("text.cost-bar-label")
+    .data(rows)
+    .join("text")
+    .attr("class", "cost-bar-label")
+    .attr("x", -10)
+    .attr("y", (row) => y(row.id) + y.bandwidth() / 2 + 4)
+    .attr("text-anchor", "end")
+    .text((row) => shortText(row.label, 18));
+
+  const bars = g.selectAll("g.cost-bar")
+    .data(rows)
+    .join("g")
+    .attr("class", "cost-bar")
+    .attr("transform", (row) => `translate(0,${y(row.id)})`)
+    .on("click", (_event, row) => selectCostRow(row));
+
+  bars.append("title")
+    .text((row) => `${row.label}: ${costValueLabel(row.value, model.basis, model.source === "delta")}`);
+
+  bars.append("rect")
+    .attr("height", y.bandwidth())
+    .attr("width", (row) => Math.max(2, x(row.magnitude)))
+    .attr("rx", 4)
+    .attr("fill", (row, index) => costColor(index, row, model))
+    .attr("opacity", (row) => model.source === "delta" && row.value < 0 ? 0.58 : 0.9);
+
+  bars.append("text")
+    .attr("class", "cost-bar-value")
+    .attr("x", (row) => Math.min(innerWidth - 4, x(row.magnitude) + 7))
+    .attr("y", y.bandwidth() / 2 + 4)
+    .text((row) => costValueLabel(row.value, model.basis, model.source === "delta"));
+}
+
+function renderCostScatter(model) {
+  const stage = $("#cost-scatter-stage");
+  if (!stage) return;
+  const rows = [...model.rows].sort((left, right) => right.magnitude - left.magnitude).slice(0, 220);
+  if (!rows.length) return;
+  const { width, height } = costStageSize(stage, 420, 320);
+  const margin = { top: 20, right: 22, bottom: 34, left: 54 };
+  const innerWidth = Math.max(180, width - margin.left - margin.right);
+  const innerHeight = Math.max(180, height - margin.top - margin.bottom);
+  const x = d3.scaleSqrt()
+    .domain([0, d3.max(rows, (row) => row.magnitude) || 1])
+    .range([0, innerWidth]);
+  const severities = ["none", "medium", "high", "critical"];
+  const y = d3.scalePoint()
+    .domain(severities)
+    .range([innerHeight, 0])
+    .padding(0.48);
+  const radius = d3.scaleSqrt()
+    .domain([0, d3.max(rows, (row) => row.magnitude) || 1])
+    .range([4, 16]);
+  const svg = costSvg(stage, width, height, "Cost versus risk scatter");
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+  g.selectAll("line.cost-scatter-grid")
+    .data(severities)
+    .join("line")
+    .attr("class", "cost-scatter-grid")
+    .attr("x1", 0)
+    .attr("x2", innerWidth)
+    .attr("y1", (severity) => y(severity))
+    .attr("y2", (severity) => y(severity));
+
+  g.selectAll("text.cost-scatter-label")
+    .data(severities)
+    .join("text")
+    .attr("class", "cost-scatter-label")
+    .attr("x", -12)
+    .attr("y", (severity) => y(severity) + 4)
+    .attr("text-anchor", "end")
+    .text((severity) => severity);
+
+  g.selectAll("circle")
+    .data(rows)
+    .join("circle")
+    .attr("class", "cost-scatter-point")
+    .attr("cx", (row) => x(row.magnitude))
+    .attr("cy", (row) => y(row.severity || "none"))
+    .attr("r", (row) => radius(row.magnitude))
+    .attr("fill", (row, index) => costColor(index, row, model))
+    .attr("stroke", (row) => severityColor(row.severity))
+    .on("click", (_event, row) => selectCostRow(row))
+    .append("title")
+    .text((row) => `${row.label}: ${costValueLabel(row.value, model.basis, model.source === "delta")} / ${row.severity}`);
+
+  g.append("text")
+    .attr("class", "cost-axis-note")
+    .attr("x", innerWidth)
+    .attr("y", innerHeight + 28)
+    .attr("text-anchor", "end")
+    .text(`Cost ${COST_BASIS[model.basis].suffix}`);
+}
+
+function renderCostDelta(model) {
+  const stage = $("#cost-delta-stage");
+  if (!stage) return;
+  const rows = [
+    { label: "Estimated", value: model.estimatedTotal, tone: "estimated" },
+    { label: "Actual", value: model.actualTotal, tone: "actual" },
+    { label: "Delta", value: model.deltaTotal, tone: model.deltaTotal >= 0 ? "over" : "under" },
+  ];
+  const { width, height } = costStageSize(stage, 420, 260);
+  const margin = { top: 18, right: 18, bottom: 24, left: 86 };
+  const innerWidth = Math.max(180, width - margin.left - margin.right);
+  const innerHeight = Math.max(120, height - margin.top - margin.bottom);
+  const max = d3.max(rows, (row) => Math.abs(row.value)) || 1;
+  const x = d3.scaleLinear().domain([-max, max]).range([0, innerWidth]);
+  const y = d3.scaleBand().domain(rows.map((row) => row.label)).range([0, innerHeight]).padding(0.34);
+  const svg = costSvg(stage, width, height, "Estimated versus actual cost");
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+  g.append("line")
+    .attr("class", "cost-zero-line")
+    .attr("x1", x(0))
+    .attr("x2", x(0))
+    .attr("y1", 0)
+    .attr("y2", innerHeight);
+
+  g.selectAll("text.cost-bar-label")
+    .data(rows)
+    .join("text")
+    .attr("class", "cost-bar-label")
+    .attr("x", -10)
+    .attr("y", (row) => y(row.label) + y.bandwidth() / 2 + 4)
+    .attr("text-anchor", "end")
+    .text((row) => row.label);
+
+  const bars = g.selectAll("g.cost-delta-bar")
+    .data(rows)
+    .join("g")
+    .attr("class", "cost-delta-bar")
+    .attr("transform", (row) => `translate(0,${y(row.label)})`);
+
+  bars.append("rect")
+    .attr("x", (row) => Math.min(x(0), x(row.value)))
+    .attr("width", (row) => Math.max(2, Math.abs(x(row.value) - x(0))))
+    .attr("height", y.bandwidth())
+    .attr("rx", 4)
+    .attr("fill", (row, index) => row.tone === "under" ? cssVar("--managed", "#22c55e") : costColor(index, row, model))
+    .attr("opacity", 0.86);
+
+  bars.append("text")
+    .attr("class", "cost-bar-value")
+    .attr("x", (row) => row.value >= 0 ? Math.min(innerWidth - 4, x(row.value) + 7) : Math.max(4, x(row.value) - 7))
+    .attr("y", y.bandwidth() / 2 + 4)
+    .attr("text-anchor", (row) => row.value >= 0 ? "start" : "end")
+    .text((row) => costValueLabel(row.value, model.basis, row.label === "Delta"));
+
+  if (!model.actualResources) {
+    svg.append("text")
+      .attr("class", "cost-axis-note")
+      .attr("x", width - 14)
+      .attr("y", height - 8)
+      .attr("text-anchor", "end")
+      .text("Actual Cost Explorer data has not been imported.");
+  }
+}
+
+function costStageSize(stage, fallbackWidth, fallbackHeight) {
+  const bounds = stage.getBoundingClientRect();
+  return {
+    width: Math.max(280, Math.floor(bounds.width || fallbackWidth)),
+    height: Math.max(180, Math.floor(bounds.height || fallbackHeight)),
+  };
+}
+
+function costSvg(stage, width, height, label) {
+  stage.innerHTML = "";
+  return d3.select(stage)
+    .append("svg")
+    .attr("class", "d3-svg cost-svg")
+    .attr("viewBox", `0 0 ${width} ${height}`)
+    .attr("role", "img")
+    .attr("aria-label", label);
+}
+
+function costColor(index, item, model) {
+  if (model.source === "delta" && item.value < 0) return cssVar("--managed", "#22c55e");
+  if (item.severity === "critical" || item.maxSeverity === "critical") return cssVar("--critical", "#ef4444");
+  if (item.severity === "high" || item.maxSeverity === "high") return cssVar("--high", "#f59e0b");
+  return COST_PALETTE[index % COST_PALETTE.length];
+}
+
+function costValueLabel(value, basis, signed = false) {
+  const suffix = COST_BASIS[basis]?.suffix || "";
+  if (signed) {
+    const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+    return `${sign}${formatMoney(Math.abs(value))}${suffix}`;
+  }
+  return `${formatMoney(value)}${suffix}`;
+}
+
+function costGroupTitle(group, model) {
+  return `${group.label}: ${costValueLabel(group.value, model.basis, model.source === "delta")} across ${group.resources} resources`;
+}
+
+function selectCostRow(row) {
+  state.selection = { type: "resource", data: row.node };
+  state.selectedFinding = null;
+  state.selectedNodeId = row.id;
+  state.atlasSelection = null;
+  state.attackSelection = null;
+  selectGraphNodesByIds([row.id]);
+  showNode(row.node);
+}
+
+function selectCostGroup(group, model) {
+  state.selection = { type: "cost-group", data: group };
+  state.selectedFinding = null;
+  state.selectedNodeId = null;
+  state.atlasSelection = null;
+  state.attackSelection = null;
+  selectGraphNodesByIds(group.nodeIds);
+  showCostGroupSelection(group, model);
+}
+
+function showCostGroupSelection(group, model) {
+  const rows = [...group.rows].sort((left, right) => right.magnitude - left.magnitude).slice(0, 8);
+  $("#selection").className = "";
+  $("#selection").innerHTML = `
+    <div class="selected-title">${escapeHtml(COST_GROUP_FIELDS[model.groupBy].label)} / ${escapeHtml(group.label)}</div>
+    <div class="selected-meta">${escapeHtml(costValueLabel(group.value, model.basis, model.source === "delta"))} across ${group.resources} resources</div>
+    <div class="kv">
+      ${kv("resources", group.resources)}
+      ${kv("estimated", costValueLabel(group.estimated, model.basis))}
+      ${kv("actual", costValueLabel(group.actual, model.basis))}
+      ${kv("delta", costValueLabel(group.actual - group.estimated, model.basis, true))}
+      ${kv("services", [...group.services].join(", ") || "n/a")}
+      ${kv("severity", group.maxSeverity)}
+    </div>
+    ${objectList("Top resources", rows.map((row) => `${row.label}: ${costValueLabel(row.value, model.basis, model.source === "delta")}`))}
+  `;
+}
+
 function buildGroupLaneData(groupBy) {
   return groupBy === "relationshipType" ? relationshipGroups() : nodeGroups(groupBy);
 }
@@ -2404,6 +3073,12 @@ function renderRiskSummary(nodes = currentFilteredNodeData()) {
   if (highCount) {
     chips.push(riskChip(`${highCount} high`, { severity: "high" }, "high"));
   }
+  if (state.costMode !== "off") {
+    const cost = visibleCostTotal(nodes, state.costMode);
+    if (cost.monthlyUsd > 0) {
+      chips.push(`<button type="button" class="risk-chip cost" title="${escapeHtml(COST_MODE_META[state.costMode].label)}">${escapeHtml(formatCompactMoney(cost.monthlyUsd))}/mo</button>`);
+    }
+  }
 
   const environment = topRiskFacet(nodes, "environment");
   const application = topRiskFacet(nodes, "application");
@@ -2421,6 +3096,16 @@ function renderRiskSummary(nodes = currentFilteredNodeData()) {
   summaryPanel.innerHTML = chips.length
     ? chips.join("")
     : '<span class="risk-empty">no high risk</span>';
+}
+
+function visibleCostTotal(nodes, mode) {
+  return nodes.reduce((total, node) => {
+    const data = node.data || node;
+    total.monthlyUsd += Number(data.cost?.[mode]?.monthlyUsd || 0);
+    total.dailyUsd += Number(data.cost?.[mode]?.dailyUsd || 0);
+    total.hourlyUsd += Number(data.cost?.[mode]?.hourlyUsd || 0);
+    return total;
+  }, { hourlyUsd: 0, dailyUsd: 0, monthlyUsd: 0 });
 }
 
 function topRiskFacet(nodes, key) {
@@ -2538,6 +3223,7 @@ function showNode(data) {
       ${kv("finding", (data.findingTypes || []).join(", ") || "none")}
       ${kv("arn", data.arn || "n/a", data.arn)}
     </div>
+    ${costInspector(data)}
     ${providerInspector(data)}
     ${jsonDetails("Tags", data.tags)}
     ${jsonDetails("Attributes", data.attributes)}
@@ -2593,6 +3279,33 @@ function showFinding(finding) {
   `;
   if (state.focusMode === "blast") applyFilters();
   else renderCurrentView();
+}
+
+function costInspector(data) {
+  const costs = data.cost || {};
+  const rows = ["estimated", "actual"]
+    .map((mode) => [mode, costs[mode]])
+    .filter(([, cost]) => cost && Number(cost.monthlyUsd) >= 0)
+    .map(([mode, cost]) => `
+      <div class="cost-row ${mode === state.costMode ? "active" : ""}">
+        <div>
+          <strong>${escapeHtml(mode)}</strong>
+          <span>${escapeHtml(cost.confidence || "unknown")} confidence</span>
+        </div>
+        <div>
+          <span>${escapeHtml(formatMoney(cost.hourlyUsd || 0))}/h</span>
+          <span>${escapeHtml(formatMoney(cost.dailyUsd || 0))}/d</span>
+          <span>${escapeHtml(formatMoney(cost.monthlyUsd || 0))}/mo</span>
+        </div>
+      </div>
+    `);
+  if (!rows.length) return "";
+  const notes = ["estimated", "actual"]
+    .flatMap((mode) => (costs[mode]?.notes || []).map((note) => `${mode}: ${note}`));
+  return inspectorPanel("Cost", `
+    <div class="cost-list">${rows.join("")}</div>
+    ${notes.length ? objectList("Notes", notes.slice(0, 6)) : ""}
+  `);
 }
 
 function providerInspector(data) {
@@ -2772,6 +3485,22 @@ function formatDate(value) {
   });
 }
 
+function formatMoney(value) {
+  const number = Number(value || 0);
+  return `$${number.toLocaleString("en-US", {
+    minimumFractionDigits: number >= 10 ? 0 : 2,
+    maximumFractionDigits: number >= 10 ? 0 : 2,
+  })}`;
+}
+
+function formatCompactMoney(value) {
+  const number = Number(value || 0);
+  if (number >= 1_000_000) return `$${(number / 1_000_000).toFixed(1)}M`;
+  if (number >= 1_000) return `$${(number / 1_000).toFixed(1)}K`;
+  if (number >= 10) return `$${Math.round(number)}`;
+  return `$${number.toFixed(2)}`;
+}
+
 function shortText(value, maxLength) {
   const text = String(value);
   if (text.length <= maxLength) return text;
@@ -2819,6 +3548,35 @@ function syncViewControls() {
   document.querySelectorAll(".view-button[data-view]").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === state.viewMode);
   });
+}
+
+function cycleCostMode() {
+  const index = COST_MODES.indexOf(state.costMode);
+  const next = COST_MODES[(Math.max(0, index) + 1) % COST_MODES.length];
+  setCostMode(next);
+}
+
+function setCostMode(mode) {
+  state.costMode = COST_MODES.includes(mode) ? mode : "off";
+  syncCostControl();
+  updateCostMetric();
+  if (state.cy) {
+    state.cy.style().update();
+  }
+  renderRiskSummary();
+  renderCurrentView();
+  updateUrlFromFilters();
+}
+
+function syncCostControl() {
+  const button = $("#cost-mode");
+  if (!button) return;
+  const meta = COST_MODE_META[state.costMode] || COST_MODE_META.off;
+  button.title = meta.label;
+  button.setAttribute("aria-label", meta.label);
+  button.innerHTML = iconSvg(meta.icon);
+  button.classList.toggle("active", state.costMode !== "off");
+  button.dataset.costMode = state.costMode;
 }
 
 function cycleViewMode() {
@@ -3169,6 +3927,39 @@ function commandList() {
     })),
     { id: "findings-only", label: state.filters.findingsOnly ? "All resources" : "Findings only", hint: "", icon: "icon-finding", run: () => toggleFilter("findingsOnly") },
     { id: "terraform-only", label: state.filters.managedOnly ? "All management states" : "Terraform only", hint: "", icon: "icon-managed", run: () => toggleFilter("managedOnly") },
+    { id: "cost-off", label: "Cost overlay: Off", hint: "$", icon: "icon-cost", run: () => setCostMode("off") },
+    { id: "cost-estimated", label: "Cost overlay: Estimated", hint: "$", icon: "icon-cost", run: () => setCostMode("estimated") },
+    { id: "cost-actual", label: "Cost overlay: Actual", hint: "$", icon: "icon-cost", run: () => setCostMode("actual") },
+    ...Object.entries(COST_ANALYTICS_SOURCES).map(([key, meta]) => ({
+      id: `cost-source-${key}`,
+      label: `Cost analytics: ${meta.label}`,
+      hint: key === "estimated" ? "C" : "",
+      icon: "icon-cost",
+      run: () => {
+        state.costAnalytics.source = key;
+        if (state.viewMode === "cost") {
+          renderCurrentView();
+          updateUrlFromFilters();
+        } else {
+          setViewMode("cost");
+        }
+      },
+    })),
+    ...Object.entries(COST_BASIS).map(([key, meta]) => ({
+      id: `cost-basis-${key}`,
+      label: `Cost basis: ${meta.label}`,
+      hint: "",
+      icon: "icon-cost",
+      run: () => {
+        state.costAnalytics.basis = key;
+        if (state.viewMode === "cost") {
+          renderCurrentView();
+          updateUrlFromFilters();
+        } else {
+          setViewMode("cost");
+        }
+      },
+    })),
     { id: "layout-layers", label: "Layout: Layers", hint: "", icon: "icon-relation", run: () => setLayout("breadthfirst") },
     { id: "layout-force", label: "Layout: Force", hint: "", icon: "icon-relation", run: () => setLayout("cose") },
     { id: "layout-circle", label: "Layout: Circle", hint: "", icon: "icon-relation", run: () => setLayout("circle") },
@@ -3260,7 +4051,24 @@ function compactNode(data) {
     terraform_address: data.terraformAddress || null,
     severity: data.severity || null,
     finding_types: data.findingTypes || [],
+    cost: compactCost(data.cost),
   };
+}
+
+function compactCost(costs = {}) {
+  const compact = {};
+  for (const mode of ["estimated", "actual"]) {
+    const cost = costs[mode];
+    if (!cost) continue;
+    compact[mode] = {
+      hourly_usd: cost.hourlyUsd || 0,
+      daily_usd: cost.dailyUsd || 0,
+      monthly_usd: cost.monthlyUsd || 0,
+      confidence: cost.confidence || null,
+      source: cost.source || null,
+    };
+  }
+  return compact;
 }
 
 function compactFinding(finding) {
@@ -3460,6 +4268,7 @@ function bindControls() {
   $("#layout").addEventListener("change", (event) => runLayout(event.target.value));
   $("#fit").addEventListener("click", fitGraph);
   $("#spread").addEventListener("click", toggleSpreadMode);
+  $("#cost-mode").addEventListener("click", cycleCostMode);
   $("#reset")?.addEventListener("click", resetView);
   $("#agent-copy").addEventListener("click", copyAgentContext);
   $("#theme-toggle").addEventListener("click", toggleTheme);
@@ -3564,6 +4373,14 @@ function loadFiltersFromUrl() {
   state.viewMode = VIEW_MODES.includes(view) ? view : "graph";
   const group = params.get("group") || "environment";
   state.groupBy = GROUP_FIELDS[group] ? group : "environment";
+  const cost = params.get("cost") || "off";
+  state.costMode = COST_MODES.includes(cost) ? cost : "off";
+  const costSource = params.get("costSource") || state.costAnalytics.source;
+  state.costAnalytics.source = COST_ANALYTICS_SOURCES[costSource] ? costSource : "estimated";
+  const costBasis = params.get("costBasis") || state.costAnalytics.basis;
+  state.costAnalytics.basis = COST_BASIS[costBasis] ? costBasis : "month";
+  const costGroup = params.get("costGroup") || state.costAnalytics.groupBy;
+  state.costAnalytics.groupBy = COST_GROUP_FIELDS[costGroup] ? costGroup : "service";
   state.spreadMode = params.get("spread") === "1";
   state.panels.inspector = params.get("inspector") !== "0";
   state.panels.findings = params.get("findingsPanel") !== "0";
@@ -3582,6 +4399,7 @@ function syncControlsFromState() {
   $("#managed-only").checked = state.filters.managedOnly;
   syncModeControls();
   syncViewControls();
+  syncCostControl();
   syncSpreadControl();
   syncPanelLayout({ refresh: false });
 }
@@ -3601,6 +4419,10 @@ function updateUrlFromFilters() {
   if (state.focusMode !== "all") params.set("mode", state.focusMode);
   if (state.viewMode !== "graph") params.set("view", state.viewMode);
   if (state.groupBy !== "environment") params.set("group", state.groupBy);
+  if (state.costMode !== "off") params.set("cost", state.costMode);
+  if (state.costAnalytics.source !== "estimated") params.set("costSource", state.costAnalytics.source);
+  if (state.costAnalytics.basis !== "month") params.set("costBasis", state.costAnalytics.basis);
+  if (state.costAnalytics.groupBy !== "service") params.set("costGroup", state.costAnalytics.groupBy);
   if (state.spreadMode) params.set("spread", "1");
   if (!state.panels.inspector) params.set("inspector", "0");
   if (!state.panels.findings) params.set("findingsPanel", "0");
@@ -3661,6 +4483,8 @@ function handleKeyboard(event) {
     togglePanel("findings");
   } else if (event.key.toLowerCase() === "s") {
     toggleSpreadMode();
+  } else if (event.key === "$") {
+    cycleCostMode();
   } else if (event.key.toLowerCase() === "r") {
     resetView();
   } else if (event.key.toLowerCase() === "m") {
@@ -3673,6 +4497,8 @@ function handleKeyboard(event) {
     setViewMode("exposure");
   } else if (event.key.toLowerCase() === "l") {
     setViewMode("groups");
+  } else if (event.key.toLowerCase() === "c") {
+    setViewMode("cost");
   } else if (event.key.toLowerCase() === "x") {
     setViewMode("mission");
   } else if (event.key.toLowerCase() === "t") {

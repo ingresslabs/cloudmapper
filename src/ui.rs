@@ -52,7 +52,24 @@ struct UiSummary {
     critical_findings: i64,
     high_findings: i64,
     managed_resources: i64,
+    cost: UiCostSummary,
     service_counts: Vec<ServiceCount>,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UiCostSummary {
+    estimated: UiCostTotals,
+    actual: UiCostTotals,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UiCostTotals {
+    resources: i64,
+    hourly_usd: f64,
+    daily_usd: f64,
+    monthly_usd: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,9 +113,23 @@ struct GraphNodeData {
     terraform_address: Option<String>,
     severity: Option<String>,
     finding_types: Vec<String>,
+    cost: BTreeMap<String, UiNodeCost>,
     attributes: Value,
     evidence: Value,
     raw: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UiNodeCost {
+    source: String,
+    currency: String,
+    hourly_usd: f64,
+    daily_usd: f64,
+    monthly_usd: f64,
+    confidence: String,
+    notes: Vec<String>,
+    updated_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -573,6 +604,7 @@ fn load_graph(db_path: &Path) -> Result<GraphPayload> {
     )?;
     let terraform_map = terraform_map(&connection, terraform_state_id.as_deref())?;
     let finding_map = finding_overlay(&connection, compare_run_id.as_deref())?;
+    let mut cost_map = cost_map(&connection, scan_id.as_deref())?;
 
     let mut nodes = Vec::new();
     if let Some(scan_id) = scan_id.as_deref() {
@@ -601,6 +633,7 @@ fn load_graph(db_path: &Path) -> Result<GraphPayload> {
             let evidence_json: String = row.get(12)?;
             let raw_json: Option<String> = row.get(13)?;
             let overlay = finding_map.get(&id);
+            let cost = cost_map.remove(&id).unwrap_or_default();
             Ok(GraphNode {
                 data: GraphNodeData {
                     id: id.clone(),
@@ -623,6 +656,7 @@ fn load_graph(db_path: &Path) -> Result<GraphPayload> {
                     finding_types: overlay
                         .map(|overlay| overlay.finding_types.clone())
                         .unwrap_or_default(),
+                    cost,
                     attributes: parse_json(attributes_json)?,
                     evidence: parse_json(evidence_json)?,
                     raw: parse_optional_json(raw_json)?,
@@ -763,6 +797,7 @@ fn summary_for(
         "state_id",
         terraform_state_id.as_deref(),
     )?;
+    let cost = cost_summary(connection, scan_id.as_deref())?;
     let service_counts = service_counts(connection, scan_id.as_deref())?;
     let (account_id, collected_at) = scan_metadata(connection, scan_id.as_deref())?;
 
@@ -778,6 +813,7 @@ fn summary_for(
         critical_findings,
         high_findings,
         managed_resources,
+        cost,
         service_counts,
     })
 }
@@ -878,6 +914,50 @@ fn finding_overlay(
     Ok(overlays)
 }
 
+fn cost_map(
+    connection: &Connection,
+    scan_id: Option<&str>,
+) -> Result<BTreeMap<String, BTreeMap<String, UiNodeCost>>> {
+    let Some(scan_id) = scan_id else {
+        return Ok(BTreeMap::new());
+    };
+    let mut statement = connection.prepare(
+        r#"
+        SELECT uid, mode, source, currency, hourly_usd, daily_usd, monthly_usd,
+               confidence, notes_json, updated_at
+        FROM resource_costs
+        WHERE scan_id = ?1
+        ORDER BY uid, mode
+        "#,
+    )?;
+    let rows = statement.query_map(params![scan_id], |row| {
+        let uid: String = row.get(0)?;
+        let mode: String = row.get(1)?;
+        let notes_json: String = row.get(8)?;
+        Ok((
+            uid,
+            mode,
+            UiNodeCost {
+                source: row.get(2)?,
+                currency: row.get(3)?,
+                hourly_usd: row.get(4)?,
+                daily_usd: row.get(5)?,
+                monthly_usd: row.get(6)?,
+                confidence: row.get(7)?,
+                notes: parse_json(notes_json)?,
+                updated_at: row.get(9)?,
+            },
+        ))
+    })?;
+
+    let mut costs = BTreeMap::<String, BTreeMap<String, UiNodeCost>>::new();
+    for row in rows {
+        let (uid, mode, cost) = row?;
+        costs.entry(uid).or_default().insert(mode, cost);
+    }
+    Ok(costs)
+}
+
 fn max_severity(current: Option<&str>, next: &str) -> Option<String> {
     let selected = match (
         severity_rank(current.unwrap_or("none")),
@@ -928,6 +1008,43 @@ fn count_findings(connection: &Connection, run_id: Option<&str>, severity: &str)
             |row| row.get(0),
         )
         .context("counting findings")
+}
+
+fn cost_summary(connection: &Connection, scan_id: Option<&str>) -> Result<UiCostSummary> {
+    let Some(scan_id) = scan_id else {
+        return Ok(UiCostSummary::default());
+    };
+    let mut statement = connection.prepare(
+        r#"
+        SELECT mode, COUNT(*), COALESCE(SUM(hourly_usd), 0), COALESCE(SUM(daily_usd), 0),
+               COALESCE(SUM(monthly_usd), 0)
+        FROM resource_costs
+        WHERE scan_id = ?1
+        GROUP BY mode
+        "#,
+    )?;
+    let rows = statement.query_map(params![scan_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            UiCostTotals {
+                resources: row.get(1)?,
+                hourly_usd: row.get(2)?,
+                daily_usd: row.get(3)?,
+                monthly_usd: row.get(4)?,
+            },
+        ))
+    })?;
+
+    let mut summary = UiCostSummary::default();
+    for row in rows {
+        let (mode, totals) = row?;
+        match mode.as_str() {
+            "estimated" => summary.estimated = totals,
+            "actual" => summary.actual = totals,
+            _ => {}
+        }
+    }
+    Ok(summary)
 }
 
 fn service_counts(connection: &Connection, scan_id: Option<&str>) -> Result<Vec<ServiceCount>> {
@@ -996,10 +1113,16 @@ mod tests {
         assert_eq!(graph.nodes[0].data.service, "ec2");
         assert_eq!(graph.nodes[0].data.environment.as_deref(), Some("prod"));
         assert_eq!(graph.nodes[0].data.application.as_deref(), Some("api"));
+        assert!(graph.nodes[0].data.cost.contains_key("estimated"));
+        assert!(graph.summary.cost.estimated.monthly_usd > 0.0);
 
         let json = serde_json::to_value(&graph).unwrap();
         assert!(json["summary"]["scanId"].is_string());
         assert_eq!(json["nodes"][0]["data"]["owner"], "platform");
+        assert_eq!(
+            json["nodes"][0]["data"]["cost"]["estimated"]["source"],
+            "aws-list-price-estimate"
+        );
         assert_eq!(
             json["summary"]["serviceCounts"][0]["resourceType"],
             "instance"
@@ -1095,16 +1218,24 @@ mod tests {
         assert!(INDEX_HTML.contains("data-theme=\"light\""));
         assert!(INDEX_HTML.contains("class=\"graph-header\""));
         assert!(INDEX_HTML.contains("data-view=\"mission\""));
+        assert!(INDEX_HTML.contains("data-view=\"cost\""));
         assert!(INDEX_HTML.contains("/xterm.css"));
         assert!(INDEX_HTML.contains("/xterm.js"));
         assert!(INDEX_HTML.contains("icon-spread"));
         assert!(INDEX_HTML.contains("icon-panel-left"));
         assert!(INDEX_HTML.contains("icon-panel-right"));
+        assert!(INDEX_HTML.contains("id=\"cost-mode\""));
+        assert!(INDEX_HTML.contains("icon-cost"));
         assert!(APP_CSS.contains("#spread.active"));
+        assert!(APP_CSS.contains(".cost-row.active"));
+        assert!(APP_CSS.contains(".cost-analytics-grid"));
         assert!(APP_CSS.contains(".mission-terminal"));
         assert!(APP_CSS.contains(".workspace.hide-inspector"));
         assert!(APP_CSS.contains(".workspace.hide-findings"));
         assert!(APP_JS.contains("function spreadGraph()"));
+        assert!(APP_JS.contains("function setCostMode"));
+        assert!(APP_JS.contains("function renderCostAnalytics()"));
+        assert!(APP_JS.contains("COST_BASIS"));
         assert!(APP_JS.contains("function renderMissionTerminal()"));
         assert!(APP_JS.contains("function toggleSpreadMode()"));
         assert!(APP_JS.contains("function togglePanel(panel)"));
@@ -1113,6 +1244,8 @@ mod tests {
         assert!(APP_JS.contains("params.set(\"spread\", \"1\")"));
         assert!(APP_JS.contains("params.set(\"inspector\", \"0\")"));
         assert!(APP_JS.contains("params.set(\"findingsPanel\", \"0\")"));
+        assert!(APP_JS.contains("params.set(\"cost\", state.costMode)"));
+        assert!(APP_JS.contains("params.set(\"costBasis\", state.costAnalytics.basis)"));
         assert!(APP_JS.contains("Spread graph"));
         assert!(APP_JS.contains("Compact graph"));
     }
@@ -1164,7 +1297,7 @@ mod tests {
                     ("Application", "api"),
                     ("Owner", "platform"),
                 ]),
-                attributes: json!({}),
+                attributes: json!({ "instance_type": "t3.small" }),
                 evidence: Vec::new(),
                 raw: None,
             }],

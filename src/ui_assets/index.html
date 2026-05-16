@@ -37,6 +37,10 @@
         <path d="M12 9v5"></path>
         <path d="M12 17h.01"></path>
       </symbol>
+      <symbol id="icon-cost" viewBox="0 0 24 24">
+        <path d="M12 3v18"></path>
+        <path d="M17 7.5c-.8-1-2.4-1.7-4.2-1.7-2.4 0-4.3 1.1-4.3 2.8 0 1.6 1.7 2.3 4.2 2.8 2.7.6 4.6 1.3 4.6 3.3 0 1.9-2 3.1-4.7 3.1-2 0-3.8-.7-4.8-1.9"></path>
+      </symbol>
       <symbol id="icon-finding" viewBox="0 0 24 24">
         <circle cx="12" cy="12" r="9"></circle>
         <path d="M12 7v6"></path>
@@ -180,6 +184,9 @@
           <button id="spread" type="button" title="Spread graph" aria-label="Spread graph">
             <svg class="icon" aria-hidden="true"><use href="#icon-spread"></use></svg>
           </button>
+          <button id="cost-mode" type="button" title="Cost overlay off" aria-label="Cost overlay off">
+            <svg class="icon" aria-hidden="true"><use href="#icon-cost"></use></svg>
+          </button>
           <button id="agent-copy" type="button" title="Copy agent context" aria-label="Copy agent context">
             <svg class="icon" aria-hidden="true"><use href="#icon-agent"></use></svg>
           </button>
@@ -227,6 +234,7 @@
           <span title="Resources"><svg class="icon" aria-hidden="true"><use href="#icon-resource"></use></svg><strong id="metric-resources">0</strong></span>
           <span title="Relationships"><svg class="icon" aria-hidden="true"><use href="#icon-relation"></use></svg><strong id="metric-edges">0</strong></span>
           <span title="Terraform managed"><svg class="icon" aria-hidden="true"><use href="#icon-managed"></use></svg><strong id="metric-managed">0</strong></span>
+          <span class="cost" title="Estimated monthly cost"><svg class="icon" aria-hidden="true"><use href="#icon-cost"></use></svg><strong id="metric-cost">$0</strong></span>
           <span class="risk" title="Critical and high findings"><svg class="icon" aria-hidden="true"><use href="#icon-risk"></use></svg><strong id="metric-risk">0</strong></span>
           <button id="theme-toggle" type="button" title="Dark theme" aria-label="Dark theme">
             <svg class="icon" aria-hidden="true"><use href="#icon-moon"></use></svg>
@@ -256,6 +264,9 @@
               </button>
               <button class="view-button" type="button" data-view="groups" title="Groups" aria-label="Groups">
                 <svg class="icon" aria-hidden="true"><use href="#icon-all"></use></svg>
+              </button>
+              <button class="view-button" type="button" data-view="cost" title="Cost analytics" aria-label="Cost analytics">
+                <svg class="icon" aria-hidden="true"><use href="#icon-cost"></use></svg>
               </button>
               <button class="view-button" type="button" data-view="attack" title="Attack paths" aria-label="Attack paths">
                 <svg class="icon" aria-hidden="true"><use href="#icon-attack"></use></svg>
