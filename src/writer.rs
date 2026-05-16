@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use crate::db::write_inventory_db;
 use crate::model::{GENERATOR_NAME, Inventory};
 
-pub fn write_infra(out: &Path, inventory: &Inventory, allow_non_empty_out: bool) -> Result<()> {
+pub fn write_infra(out: &Path, inventory: &Inventory, allow_non_empty_out: bool) -> Result<String> {
     ensure_output_dir(out, allow_non_empty_out)?;
 
     write_json(out.join("manifest.json").as_path(), &inventory.manifest())?;
@@ -19,10 +19,10 @@ pub fn write_infra(out: &Path, inventory: &Inventory, allow_non_empty_out: bool)
         &inventory.relationships,
     )?;
     write_jsonl(out.join("errors.jsonl").as_path(), &inventory.errors)?;
-    write_inventory_db(&out.join("infra.sqlite"), inventory)?;
+    let scan_id = write_inventory_db(&out.join("map.db"), inventory)?;
     write_schemas(&out.join("schemas"))?;
 
-    Ok(())
+    Ok(scan_id)
 }
 
 fn ensure_output_dir(out: &Path, allow_non_empty_out: bool) -> Result<()> {
@@ -117,7 +117,7 @@ const RESOURCE_SCHEMA: &str = r#"{
   "required": ["uid", "provider", "account_id", "partition", "region", "service", "type", "id"],
   "properties": {
     "uid": { "type": "string" },
-    "provider": { "const": "aws" },
+    "provider": { "type": "string" },
     "account_id": { "type": "string" },
     "partition": { "type": "string" },
     "region": { "type": "string" },
@@ -204,7 +204,7 @@ mod tests {
         assert!(temp.path().join("relationships.jsonl").exists());
         assert!(temp.path().join("errors.jsonl").exists());
         assert!(temp.path().join("graph.json").exists());
-        assert!(temp.path().join("infra.sqlite").exists());
+        assert!(temp.path().join("map.db").exists());
         assert!(temp.path().join("schemas/resource.schema.json").exists());
     }
 

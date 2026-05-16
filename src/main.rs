@@ -1,6 +1,10 @@
+mod agent_export;
 mod aws_scan;
 mod compare;
 mod db;
+mod demo;
+mod k8s_demo;
+mod k8s_scan;
 mod model;
 mod terraform_state;
 mod ui;
@@ -9,18 +13,23 @@ mod writer;
 use std::path::PathBuf;
 
 use anyhow::{Error, Result};
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum};
+use clap_complete::{Shell, generate};
 use tracing_subscriber::FmtSubscriber;
 
+use crate::agent_export::{AgentExportOptions, export_agent_bundle};
 use crate::aws_scan::{ScanOptions, scan_account};
 use crate::compare::compare_infra;
+use crate::demo::write_demo_bundle;
+use crate::k8s_demo::write_k8s_demo_bundle;
+use crate::k8s_scan::{K8sScanOptions, scan_cluster, write_k8s_findings};
 use crate::terraform_state::{export_terraform_state, import_terraform_state_file};
 use crate::ui::serve_ui;
 use crate::writer::write_infra;
 
 #[derive(Debug, Parser)]
 #[command(name = "cloudmapper")]
-#[command(about = "Export AWS account infrastructure as agent-readable JSON")]
+#[command(about = "Export cloud and Kubernetes infrastructure as agent-readable JSON")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -29,21 +38,41 @@ struct Cli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Scan an AWS account and write an infra/ JSON bundle.
-    Scan(ScanArgs),
+    /// Scan a provider and write an infra/ JSON bundle.
+    Scan {
+        #[command(subcommand)]
+        command: ScanCommand,
+    },
+    /// Write a zero-AWS large-org demo bundle with Terraform state and findings.
+    Demo(DemoArgs),
     /// Compare AWS reality with imported Terraform state and emit findings.
     Compare(CompareArgs),
-    /// Import or export Terraform state data in infra.sqlite.
+    /// Export cloudmapper data into portable formats.
+    Export {
+        #[command(subcommand)]
+        command: ExportCommand,
+    },
+    /// Import or export Terraform state data in map.db.
     Terraform {
         #[command(subcommand)]
         command: TerraformCommand,
     },
     /// Serve a local Cytoscape infrastructure graph UI.
     Ui(UiArgs),
+    /// Print shell completions to stdout.
+    Completions(CompletionsArgs),
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ScanCommand {
+    /// Scan an AWS account and write an infra/ JSON bundle.
+    Aws(AwsScanArgs),
+    /// Scan a Kubernetes cluster through kubectl and write an infra/ JSON bundle.
+    K8s(K8sScanArgs),
 }
 
 #[derive(Debug, Parser)]
-struct ScanArgs {
+struct AwsScanArgs {
     /// AWS profile name. Falls back to AWS_PROFILE or the default credential chain.
     #[arg(long)]
     profile: Option<String>,
@@ -74,9 +103,61 @@ struct ScanArgs {
 }
 
 #[derive(Debug, Parser)]
+struct K8sScanArgs {
+    /// Kubernetes context. Defaults to the current kubectl context.
+    #[arg(long)]
+    context: Option<String>,
+
+    /// kubeconfig path. Defaults to kubectl's normal kubeconfig resolution.
+    #[arg(long)]
+    kubeconfig: Option<PathBuf>,
+
+    /// Namespace to scan, or "all" for every namespace.
+    #[arg(long, default_value = "all")]
+    namespace: String,
+
+    /// kubectl executable path.
+    #[arg(long, default_value = "kubectl")]
+    kubectl: PathBuf,
+
+    /// Directory for the generated infrastructure bundle.
+    #[arg(long, default_value = "infra")]
+    out: PathBuf,
+
+    /// Include raw non-secret Kubernetes objects where supported.
+    #[arg(long)]
+    include_raw: bool,
+
+    /// Allow writing cloudmapper files into a non-empty directory that was not created by cloudmapper.
+    #[arg(long)]
+    allow_non_empty_out: bool,
+}
+
+#[derive(Debug, Parser)]
+struct DemoArgs {
+    /// Demo provider to generate.
+    #[arg(long, value_enum, default_value_t = DemoProvider::Aws)]
+    provider: DemoProvider,
+
+    /// Directory for the generated large-org demo infrastructure bundle.
+    #[arg(long, default_value = "infra")]
+    out: PathBuf,
+
+    /// Allow writing cloudmapper demo files into a non-empty directory.
+    #[arg(long)]
+    allow_non_empty_out: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DemoProvider {
+    Aws,
+    K8s,
+}
+
+#[derive(Debug, Parser)]
 struct CompareArgs {
-    /// SQLite database path.
-    #[arg(long, default_value = "infra/infra.sqlite")]
+    /// Map database path.
+    #[arg(long, default_value = "infra/map.db")]
     db: PathBuf,
 
     /// AWS scan id. Defaults to the latest scan in the database.
@@ -93,10 +174,43 @@ struct CompareArgs {
 }
 
 #[derive(Debug, clap::Subcommand)]
+enum ExportCommand {
+    /// Export one agent-ready JSON file with resources, graph, Terraform mapping, and findings.
+    Agent(AgentExportArgs),
+}
+
+#[derive(Debug, Parser)]
+struct AgentExportArgs {
+    /// Map database path.
+    #[arg(long, default_value = "infra/map.db")]
+    db: PathBuf,
+
+    /// AWS scan id. Defaults to the latest scan in the database.
+    #[arg(long)]
+    scan_id: Option<String>,
+
+    /// Terraform state id. Defaults to the latest imported Terraform state when present.
+    #[arg(long)]
+    terraform_state_id: Option<String>,
+
+    /// Compare run id. Defaults to the latest compare findings run when present.
+    #[arg(long)]
+    compare_run_id: Option<String>,
+
+    /// Output file. Use "-" to print JSON to stdout.
+    #[arg(long, default_value = "infra.agent.json")]
+    out: PathBuf,
+
+    /// Include raw scan details and Terraform attributes in the agent export.
+    #[arg(long)]
+    include_sensitive: bool,
+}
+
+#[derive(Debug, clap::Subcommand)]
 enum TerraformCommand {
-    /// Import a Terraform state file into infra.sqlite.
+    /// Import a Terraform state file into map.db.
     Import(TerraformImportArgs),
-    /// Export imported Terraform state from infra.sqlite as normalized JSON.
+    /// Export imported Terraform state from map.db as normalized JSON.
     Export(TerraformExportArgs),
 }
 
@@ -106,8 +220,8 @@ struct TerraformImportArgs {
     #[arg(long)]
     state: PathBuf,
 
-    /// SQLite database path.
-    #[arg(long, default_value = "infra/infra.sqlite")]
+    /// Map database path.
+    #[arg(long, default_value = "infra/map.db")]
     db: PathBuf,
 
     /// Optional stable state id. Defaults to lineage/serial when available.
@@ -117,8 +231,8 @@ struct TerraformImportArgs {
 
 #[derive(Debug, Parser)]
 struct TerraformExportArgs {
-    /// SQLite database path.
-    #[arg(long, default_value = "infra/infra.sqlite")]
+    /// Map database path.
+    #[arg(long, default_value = "infra/map.db")]
     db: PathBuf,
 
     /// State id to export. Defaults to the latest imported Terraform state.
@@ -132,13 +246,20 @@ struct TerraformExportArgs {
 
 #[derive(Debug, Parser)]
 struct UiArgs {
-    /// SQLite database path.
-    #[arg(long, default_value = "infra/infra.sqlite")]
+    /// Map database path.
+    #[arg(long, default_value = "infra/map.db")]
     db: PathBuf,
 
     /// Local address to bind.
     #[arg(long, default_value = "127.0.0.1:8765")]
     bind: String,
+}
+
+#[derive(Debug, Parser)]
+struct CompletionsArgs {
+    /// Shell to generate completions for.
+    #[arg(value_enum)]
+    shell: Shell,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -169,23 +290,95 @@ fn init_logging() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Scan(args) => {
-            let options = ScanOptions {
-                profile: args.profile,
-                regions: args.regions,
-                home_region: args.home_region,
-                include_raw: args.include_raw,
-            };
-            let inventory = scan_account(options).await?;
-            write_infra(&args.out, &inventory, args.allow_non_empty_out)?;
-            println!(
-                "wrote {} resources, {} relationships, and {} scan errors to {}",
-                inventory.resources.len(),
-                inventory.relationships.len(),
-                inventory.errors.len(),
-                args.out.display()
-            );
-        }
+        Command::Scan { command } => match command {
+            ScanCommand::Aws(args) => {
+                let options = ScanOptions {
+                    profile: args.profile,
+                    regions: args.regions,
+                    home_region: args.home_region,
+                    include_raw: args.include_raw,
+                };
+                let inventory = scan_account(options).await?;
+                write_infra(&args.out, &inventory, args.allow_non_empty_out)?;
+                println!(
+                    "wrote {} AWS resources, {} relationships, and {} scan errors to {}",
+                    inventory.resources.len(),
+                    inventory.relationships.len(),
+                    inventory.errors.len(),
+                    args.out.display()
+                );
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    args.out.join("map.db").display()
+                );
+            }
+            ScanCommand::K8s(args) => {
+                let output = scan_cluster(K8sScanOptions {
+                    context: args.context,
+                    kubeconfig: args.kubeconfig,
+                    namespace: args.namespace,
+                    kubectl: args.kubectl,
+                    include_raw: args.include_raw,
+                })?;
+                let scan_id = write_infra(&args.out, &output.inventory, args.allow_non_empty_out)?;
+                let findings_run_id =
+                    write_k8s_findings(&args.out.join("map.db"), &scan_id, &output.findings)?;
+                println!(
+                    "wrote {} Kubernetes resources, {} relationships, {} findings, and {} scan errors to {}",
+                    output.inventory.resources.len(),
+                    output.inventory.relationships.len(),
+                    output.findings.len(),
+                    output.inventory.errors.len(),
+                    args.out.display()
+                );
+                println!("findings: {findings_run_id}");
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    args.out.join("map.db").display()
+                );
+            }
+        },
+        Command::Demo(args) => match args.provider {
+            DemoProvider::Aws => {
+                let summary = write_demo_bundle(&args.out, args.allow_non_empty_out)?;
+                println!(
+                    "wrote AWS large-org demo bundle with {} resources, {} relationships, and {} findings to {}",
+                    summary.resources,
+                    summary.relationships,
+                    summary.findings,
+                    summary.out.display()
+                );
+                println!(
+                    "terraform: {} ({})",
+                    summary.state_path.display(),
+                    summary.terraform_state_id
+                );
+                println!("findings: {}", summary.findings_path.display());
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    summary.db_path.display()
+                );
+            }
+            DemoProvider::K8s => {
+                let summary = write_k8s_demo_bundle(&args.out, args.allow_non_empty_out)?;
+                println!(
+                    "wrote Kubernetes platform demo bundle with {} resources, {} relationships, and {} findings to {}",
+                    summary.resources,
+                    summary.relationships,
+                    summary.findings,
+                    summary.out.display()
+                );
+                println!(
+                    "findings: {} ({})",
+                    summary.findings_path.display(),
+                    summary.run_id
+                );
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    summary.db_path.display()
+                );
+            }
+        },
         Command::Compare(args) => {
             let report = compare_infra(
                 &args.db,
@@ -201,10 +394,42 @@ async fn run() -> Result<()> {
                     args.db.display(),
                     out.display()
                 );
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    args.db.display()
+                );
             } else {
                 println!("{json}");
             }
         }
+        Command::Export { command } => match command {
+            ExportCommand::Agent(args) => {
+                let export = export_agent_bundle(
+                    &args.db,
+                    args.scan_id.as_deref(),
+                    args.terraform_state_id.as_deref(),
+                    args.compare_run_id.as_deref(),
+                    AgentExportOptions {
+                        include_sensitive: args.include_sensitive,
+                    },
+                )?;
+                let json = serde_json::to_string_pretty(&export)?;
+                if args.out.as_os_str() == "-" {
+                    println!("{json}");
+                } else {
+                    std::fs::write(&args.out, format!("{json}\n"))?;
+                    println!(
+                        "wrote {} agent export with {} resources, {} relationships, and {} findings from {} to {}",
+                        export.redaction.mode,
+                        export.counts.resources,
+                        export.counts.relationships,
+                        export.counts.findings,
+                        args.db.display(),
+                        args.out.display()
+                    );
+                }
+            }
+        },
         Command::Terraform { command } => match command {
             TerraformCommand::Import(args) => {
                 let summary = import_terraform_state_file(&args.db, &args.state, args.state_id)?;
@@ -213,6 +438,10 @@ async fn run() -> Result<()> {
                     summary.resource_instances,
                     args.db.display(),
                     summary.state_id
+                );
+                println!(
+                    "next: cloudmapper compare --db {} --out findings.json",
+                    args.db.display()
                 );
             }
             TerraformCommand::Export(args) => {
@@ -233,6 +462,11 @@ async fn run() -> Result<()> {
         },
         Command::Ui(args) => {
             serve_ui(&args.db, &args.bind)?;
+        }
+        Command::Completions(args) => {
+            let mut command = Cli::command();
+            let name = command.get_name().to_string();
+            generate(args.shell, &mut command, name, &mut std::io::stdout());
         }
     }
 

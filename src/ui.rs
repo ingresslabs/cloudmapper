@@ -13,6 +13,8 @@ use crate::db::{latest_terraform_state_id, open_cloudmapper_db};
 const INDEX_HTML: &str = include_str!("ui_assets/index.html");
 const APP_CSS: &str = include_str!("ui_assets/app.css");
 const APP_JS: &str = include_str!("ui_assets/app.js");
+const CYTOSCAPE_JS: &str = include_str!("ui_assets/cytoscape.min.js");
+const D3_JS: &str = include_str!("ui_assets/d3.min.js");
 
 #[derive(Clone)]
 struct UiState {
@@ -61,14 +63,25 @@ struct GraphNode {
 struct GraphNodeData {
     id: String,
     label: String,
+    provider: String,
+    account_id: String,
+    partition: String,
     service: String,
     resource_type: String,
     region: String,
+    namespace: Option<String>,
     arn: Option<String>,
     name: Option<String>,
+    tags: Value,
+    environment: Option<String>,
+    application: Option<String>,
+    owner: Option<String>,
     terraform_address: Option<String>,
     severity: Option<String>,
     finding_types: Vec<String>,
+    attributes: Value,
+    evidence: Value,
+    raw: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +96,8 @@ struct GraphEdgeData {
     source: String,
     target: String,
     relationship_type: String,
+    attributes: Value,
+    evidence: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +116,7 @@ struct FindingRow {
     reason: String,
     recommended_action: String,
     blast_radius: Vec<String>,
+    evidence: Value,
     attributes: Value,
 }
 
@@ -198,6 +214,14 @@ fn route_request(path: &str, state: &UiState) -> Result<Option<UiBody>> {
             content_type: "application/javascript; charset=utf-8",
             body: APP_JS.as_bytes(),
         },
+        "/cytoscape.min.js" => UiBody::Static {
+            content_type: "application/javascript; charset=utf-8",
+            body: CYTOSCAPE_JS.as_bytes(),
+        },
+        "/d3.min.js" => UiBody::Static {
+            content_type: "application/javascript; charset=utf-8",
+            body: D3_JS.as_bytes(),
+        },
         "/api/summary" => UiBody::Json(serde_json::to_vec(&load_summary(&state.db_path)?)?),
         "/api/graph" => UiBody::Json(serde_json::to_vec(&load_graph(&state.db_path)?)?),
         "/api/findings" => UiBody::Json(serde_json::to_vec(&load_findings(&state.db_path)?)?),
@@ -254,7 +278,8 @@ fn load_graph(db_path: &Path) -> Result<GraphPayload> {
     if let Some(scan_id) = scan_id.as_deref() {
         let mut statement = connection.prepare(
             r#"
-            SELECT uid, service, resource_type, region, resource_id, arn, name
+            SELECT uid, provider, account_id, partition, service, resource_type, region,
+                   resource_id, arn, name, tags_json, attributes_json, evidence_json, raw_json
             FROM resources
             WHERE scan_id = ?1
             ORDER BY service, resource_type, name, resource_id
@@ -262,27 +287,45 @@ fn load_graph(db_path: &Path) -> Result<GraphPayload> {
         )?;
         let rows = statement.query_map(params![scan_id], |row| {
             let id: String = row.get(0)?;
-            let service: String = row.get(1)?;
-            let resource_type: String = row.get(2)?;
-            let region: String = row.get(3)?;
-            let resource_id: String = row.get(4)?;
-            let arn: Option<String> = row.get(5)?;
-            let name: Option<String> = row.get(6)?;
+            let provider: String = row.get(1)?;
+            let account_id: String = row.get(2)?;
+            let partition: String = row.get(3)?;
+            let service: String = row.get(4)?;
+            let resource_type: String = row.get(5)?;
+            let region: String = row.get(6)?;
+            let resource_id: String = row.get(7)?;
+            let arn: Option<String> = row.get(8)?;
+            let name: Option<String> = row.get(9)?;
+            let tags: Value = parse_json(row.get::<_, String>(10)?)?;
+            let attributes_json: String = row.get(11)?;
+            let evidence_json: String = row.get(12)?;
+            let raw_json: Option<String> = row.get(13)?;
             let overlay = finding_map.get(&id);
             Ok(GraphNode {
                 data: GraphNodeData {
                     id: id.clone(),
                     label: name.clone().unwrap_or(resource_id),
+                    provider: provider.clone(),
+                    account_id,
+                    partition,
                     service,
                     resource_type,
+                    namespace: namespace_value(&provider, &region, &tags),
                     region,
                     arn,
                     name,
+                    environment: tag_value(&tags, "Environment"),
+                    application: tag_value(&tags, "Application"),
+                    owner: tag_value(&tags, "Owner"),
+                    tags,
                     terraform_address: terraform_map.get(&id).cloned(),
                     severity: overlay.and_then(|overlay| overlay.severity.clone()),
                     finding_types: overlay
                         .map(|overlay| overlay.finding_types.clone())
                         .unwrap_or_default(),
+                    attributes: parse_json(attributes_json)?,
+                    evidence: parse_json(evidence_json)?,
+                    raw: parse_optional_json(raw_json)?,
                 },
             })
         })?;
@@ -299,7 +342,7 @@ fn load_graph(db_path: &Path) -> Result<GraphPayload> {
     if let Some(scan_id) = scan_id.as_deref() {
         let mut statement = connection.prepare(
             r#"
-            SELECT uid, from_uid, to_uid, relationship_type
+            SELECT uid, from_uid, to_uid, relationship_type, attributes_json, evidence_json
             FROM relationships
             WHERE scan_id = ?1
             ORDER BY relationship_type, uid
@@ -312,6 +355,8 @@ fn load_graph(db_path: &Path) -> Result<GraphPayload> {
                     source: row.get(1)?,
                     target: row.get(2)?,
                     relationship_type: row.get(3)?,
+                    attributes: parse_json(row.get::<_, String>(4)?)?,
+                    evidence: parse_json(row.get::<_, String>(5)?)?,
                 },
             })
         })?;
@@ -330,6 +375,25 @@ fn load_graph(db_path: &Path) -> Result<GraphPayload> {
     })
 }
 
+fn namespace_value(provider: &str, region: &str, tags: &Value) -> Option<String> {
+    tag_value(tags, "Namespace").or_else(|| {
+        if provider == "k8s" && region != "cluster" && region != "global" {
+            Some(region.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn tag_value(tags: &Value, key: &str) -> Option<String> {
+    tags.as_object()?
+        .iter()
+        .find(|(tag_key, _)| tag_key.eq_ignore_ascii_case(key))
+        .and_then(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 fn load_findings(db_path: &Path) -> Result<FindingsPayload> {
     let connection = open_cloudmapper_db(db_path)?;
     let run_id = latest_compare_run_id(&connection)?;
@@ -343,7 +407,7 @@ fn load_findings(db_path: &Path) -> Result<FindingsPayload> {
     let mut statement = connection.prepare(
         r#"
         SELECT id, finding_type, severity, aws_uid, terraform_address, reason,
-               recommended_action, blast_radius_json, attributes_json
+               recommended_action, blast_radius_json, evidence_json, attributes_json
         FROM findings
         WHERE run_id = ?1
         ORDER BY
@@ -359,7 +423,8 @@ fn load_findings(db_path: &Path) -> Result<FindingsPayload> {
     )?;
     let rows = statement.query_map(params![run_id_value], |row| {
         let blast_radius_json: String = row.get(7)?;
-        let attributes_json: String = row.get(8)?;
+        let evidence_json: String = row.get(8)?;
+        let attributes_json: String = row.get(9)?;
         Ok(FindingRow {
             id: row.get(0)?,
             finding_type: row.get(1)?,
@@ -369,6 +434,7 @@ fn load_findings(db_path: &Path) -> Result<FindingsPayload> {
             reason: row.get(5)?,
             recommended_action: row.get(6)?,
             blast_radius: parse_json(blast_radius_json)?,
+            evidence: parse_json(evidence_json)?,
             attributes: parse_json(attributes_json)?,
         })
     })?;
@@ -594,6 +660,12 @@ fn parse_json<T: serde::de::DeserializeOwned>(value: String) -> rusqlite::Result
     })
 }
 
+fn parse_optional_json<T: serde::de::DeserializeOwned>(
+    value: Option<String>,
+) -> rusqlite::Result<Option<T>> {
+    value.map(parse_json).transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -604,24 +676,30 @@ mod tests {
 
     use crate::compare::compare_infra;
     use crate::db::write_inventory_db;
+    use crate::demo::write_demo_bundle;
     use crate::model::{Generator, Inventory, Resource, SCHEMA_VERSION};
 
     use super::*;
 
     #[test]
-    fn loads_graph_payload_from_sqlite() {
+    fn loads_graph_payload_from_map_db() {
         let temp = tempdir().unwrap();
-        let db_path = temp.path().join("infra.sqlite");
+        let db_path = temp.path().join("map.db");
         write_inventory_db(&db_path, &sample_inventory()).unwrap();
 
         let graph = load_graph(&db_path).unwrap();
 
         assert_eq!(graph.summary.resources, 1);
         assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].data.provider, "aws");
+        assert_eq!(graph.nodes[0].data.account_id, "123456789012");
         assert_eq!(graph.nodes[0].data.service, "ec2");
+        assert_eq!(graph.nodes[0].data.environment.as_deref(), Some("prod"));
+        assert_eq!(graph.nodes[0].data.application.as_deref(), Some("api"));
 
         let json = serde_json::to_value(&graph).unwrap();
         assert!(json["summary"]["scanId"].is_string());
+        assert_eq!(json["nodes"][0]["data"]["owner"], "platform");
         assert_eq!(
             json["summary"]["serviceCounts"][0]["resourceType"],
             "instance"
@@ -631,7 +709,7 @@ mod tests {
     #[test]
     fn overlays_findings_on_graph_nodes() {
         let temp = tempdir().unwrap();
-        let db_path = temp.path().join("infra.sqlite");
+        let db_path = temp.path().join("map.db");
         write_inventory_db(&db_path, &sample_public_inventory()).unwrap();
         seed_terraform_state(&db_path);
         compare_infra(&db_path, None, None).unwrap();
@@ -650,6 +728,87 @@ mod tests {
                 .finding_types
                 .contains(&"unmanaged_public_resource".to_string())
         );
+    }
+
+    #[test]
+    fn large_demo_graph_payload_exposes_navigation_facets() {
+        let temp = tempdir().unwrap();
+        let summary = write_demo_bundle(temp.path(), false).unwrap();
+
+        let graph = load_graph(&summary.db_path).unwrap();
+
+        assert_eq!(graph.summary.resources, 414);
+        assert_eq!(graph.summary.relationships, 528);
+        assert_eq!(graph.summary.managed_resources, 100);
+        assert_eq!(graph.summary.findings, 327);
+        assert_eq!(graph.summary.critical_findings, 15);
+        assert_eq!(graph.summary.high_findings, 3);
+        assert_eq!(graph.nodes.len(), 414);
+        assert_eq!(graph.edges.len(), 528);
+        assert!(graph.nodes.iter().any(|node| {
+            node.data.environment.as_deref() == Some("prod")
+                && node.data.application.as_deref() == Some("payments")
+                && node.data.owner.as_deref() == Some("payments-platform")
+        }));
+
+        let json = serde_json::to_value(&graph).unwrap();
+        assert!(json["nodes"][0]["data"]["tags"].is_object());
+        assert!(json["nodes"][0]["data"].get("environment").is_some());
+        assert!(json["nodes"][0]["data"].get("application").is_some());
+    }
+
+    #[test]
+    fn k8s_graph_payload_exposes_provider_facets() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("map.db");
+        write_inventory_db(&db_path, &sample_k8s_inventory()).unwrap();
+
+        let graph = load_graph(&db_path).unwrap();
+
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].data.provider, "k8s");
+        assert_eq!(graph.nodes[0].data.account_id, "prod-platform-us-east-1");
+        assert_eq!(graph.nodes[0].data.partition, "kubernetes");
+        assert_eq!(
+            graph.nodes[0].data.namespace.as_deref(),
+            Some("prod-payments")
+        );
+        assert_eq!(graph.nodes[0].data.service, "core");
+        assert_eq!(graph.nodes[0].data.resource_type, "pod");
+        assert_eq!(
+            graph.nodes[0].data.owner.as_deref(),
+            Some("payments-platform")
+        );
+
+        let json = serde_json::to_value(&graph).unwrap();
+        assert_eq!(json["nodes"][0]["data"]["provider"], "k8s");
+        assert_eq!(json["nodes"][0]["data"]["namespace"], "prod-payments");
+        assert!(json["nodes"][0]["data"]["attributes"]["owner_references"].is_array());
+    }
+
+    #[test]
+    fn ui_assets_expose_spread_mode() {
+        assert!(INDEX_HTML.contains("id=\"spread\""));
+        assert!(INDEX_HTML.contains("id=\"toggle-inspector\""));
+        assert!(INDEX_HTML.contains("id=\"toggle-findings\""));
+        assert!(INDEX_HTML.contains("class=\"panel-toggle\""));
+        assert!(INDEX_HTML.contains("data-theme=\"light\""));
+        assert!(INDEX_HTML.contains("class=\"graph-header\""));
+        assert!(INDEX_HTML.contains("icon-spread"));
+        assert!(INDEX_HTML.contains("icon-panel-left"));
+        assert!(INDEX_HTML.contains("icon-panel-right"));
+        assert!(APP_CSS.contains("#spread.active"));
+        assert!(APP_CSS.contains(".workspace.hide-inspector"));
+        assert!(APP_CSS.contains(".workspace.hide-findings"));
+        assert!(APP_JS.contains("function spreadGraph()"));
+        assert!(APP_JS.contains("function toggleSpreadMode()"));
+        assert!(APP_JS.contains("function togglePanel(panel)"));
+        assert!(APP_JS.contains("? theme : \"light\""));
+        assert!(APP_JS.contains("params.set(\"spread\", \"1\")"));
+        assert!(APP_JS.contains("params.set(\"inspector\", \"0\")"));
+        assert!(APP_JS.contains("params.set(\"findingsPanel\", \"0\")"));
+        assert!(APP_JS.contains("Spread graph"));
+        assert!(APP_JS.contains("Compact graph"));
     }
 
     fn sample_inventory() -> Inventory {
@@ -675,7 +834,11 @@ mod tests {
                 id: "i-123".to_string(),
                 arn: Some("arn:aws:ec2:us-east-1:123456789012:instance/i-123".to_string()),
                 name: Some("api".to_string()),
-                tags: BTreeMap::new(),
+                tags: tags(&[
+                    ("Environment", "prod"),
+                    ("Application", "api"),
+                    ("Owner", "platform"),
+                ]),
                 attributes: json!({}),
                 evidence: Vec::new(),
                 raw: None,
@@ -698,7 +861,11 @@ mod tests {
             id: "sg-public".to_string(),
             arn: Some("arn:aws:ec2:us-east-1:123456789012:security-group/sg-public".to_string()),
             name: Some("public".to_string()),
-            tags: BTreeMap::new(),
+            tags: tags(&[
+                ("Environment", "prod"),
+                ("Application", "api"),
+                ("Owner", "platform"),
+            ]),
             attributes: json!({
                 "ingress": [{
                     "ip_protocol": "tcp",
@@ -712,6 +879,61 @@ mod tests {
             raw: None,
         });
         inventory
+    }
+
+    fn sample_k8s_inventory() -> Inventory {
+        Inventory {
+            schema_version: SCHEMA_VERSION.to_string(),
+            generator: Generator {
+                name: "cloudmapper".to_string(),
+                version: "test".to_string(),
+            },
+            account_id: "prod-platform-us-east-1".to_string(),
+            partition: "kubernetes".to_string(),
+            home_region: "cluster".to_string(),
+            regions: vec!["prod-payments".to_string()],
+            collected_at: Utc::now(),
+            resources: vec![Resource {
+                uid: "k8s:prod-platform-us-east-1:prod-payments:core:pod:prod-payments/payments-api-abc".to_string(),
+                provider: "k8s".to_string(),
+                account_id: "prod-platform-us-east-1".to_string(),
+                partition: "kubernetes".to_string(),
+                region: "prod-payments".to_string(),
+                service: "core".to_string(),
+                resource_type: "pod".to_string(),
+                id: "prod-payments/payments-api-abc".to_string(),
+                arn: None,
+                name: Some("payments-api-abc".to_string()),
+                tags: tags(&[
+                    ("Namespace", "prod-payments"),
+                    ("Environment", "prod"),
+                    ("Application", "payments"),
+                    ("Owner", "payments-platform"),
+                ]),
+                attributes: json!({
+                    "kind": "Pod",
+                    "namespace": "prod-payments",
+                    "owner_references": [{"kind": "ReplicaSet", "name": "payments-api-6d"}],
+                    "service_account": "payments-api",
+                    "host_network": false,
+                    "host_pid": false,
+                    "host_ipc": false,
+                    "containers": [{"name": "api", "image": "registry.local/payments-api:v1"}],
+                    "mounts": [{"kind": "Secret", "name": "payments-api", "source": "volume"}]
+                }),
+                evidence: Vec::new(),
+                raw: None,
+            }],
+            relationships: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    fn tags(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
     }
 
     fn seed_terraform_state(db_path: &Path) {
