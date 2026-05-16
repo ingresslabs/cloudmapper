@@ -72,7 +72,9 @@ Open `http://127.0.0.1:8765`. The demo bundle models a realistic large
 organization account with three regions, prod/stage/dev environments, six
 application teams, EC2 fleets, VPC networking, RDS databases, Lambda workers,
 S3 data buckets, IAM principals, a partial Terraform state, compare findings,
-`graph.json`, and a populated `infra/map.db`.
+estimated resource costs, `graph.json`, and a populated `infra/map.db`. Use the
+cost button in the top toolbar, or press `$`, to toggle the graph between no
+cost overlay, estimated list-price cost, and actual billed cost when imported.
 
 Try the Kubernetes workflow without a live cluster:
 
@@ -93,9 +95,46 @@ The same workflow against an AWS account is:
 cargo run -- scan aws --profile default --regions all --out infra
 cloudmapper terraform import --state terraform.tfstate --db infra/map.db
 cloudmapper compare --db infra/map.db --out findings.json
+cloudmapper cost actual --db infra/map.db --profile default --tag Environment --tag Application
 cloudmapper ui --db infra/map.db --bind 127.0.0.1:8765
 cloudmapper export agent --db infra/map.db --out infra.agent.json
 ```
+
+## Cost Overlays
+
+Every AWS scan and AWS demo writes an estimated list-price cost overlay into
+`map.db` from available inventory metadata such as EC2 instance type, EBS volume
+size, NAT gateways, RDS class, S3 storage attributes, and KMS keys. Recalculate
+it after changing a database with:
+
+```bash
+cloudmapper cost estimate --db infra/map.db
+```
+
+To add actual billed cost, import a trailing Cost Explorer window grouped by
+AWS service and cost allocation tags:
+
+```bash
+cloudmapper cost actual \
+  --db infra/map.db \
+  --profile default \
+  --days 30 \
+  --tag Environment \
+  --tag Application \
+  --tag Owner \
+  --metric UnblendedCost
+```
+
+Actual costs are matched back to graph nodes by service and tag value, then
+normalized to hourly, daily, and monthly run-rate fields. This requires Cost
+Explorer access and active cost allocation tags in AWS Billing. Untagged,
+shared, support, tax, credit, and unallocated billing lines are intentionally
+left unassigned instead of being hidden inside unrelated resources.
+
+In the Cytoscape UI, the cost toolbar button cycles `off -> estimated -> actual`.
+Costed nodes get a blue ring and scale by monthly cost. The inspector shows both
+hourly, daily, and monthly values so list-price estimates and billed Cost
+Explorer allocations can be compared on the same resource.
 
 ## Usage
 
@@ -237,8 +276,8 @@ stores:
 - `terraform_states`
 - `terraform_resource_instances`
 
-This is the local knowledge store that compare, drift, graph, export, and MCP
-commands can query without reloading the full JSON bundle.
+This is the local knowledge store that compare, drift, graph, cost, export, and
+MCP commands can query without reloading the full JSON bundle.
 
 ## Terraform State
 

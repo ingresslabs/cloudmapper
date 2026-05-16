@@ -15,6 +15,9 @@
   --medium-soft: #221b08;
   --managed: #35d399;
   --managed-soft: #0c2219;
+  --cost: #38bdf8;
+  --cost-high: #0ea5e9;
+  --cost-soft: #082436;
   --focus: #fafafa;
   --topbar-bg: rgba(0, 0, 0, 0.92);
   --float-bg: rgba(10, 10, 10, 0.88);
@@ -49,6 +52,9 @@
   --medium-soft: #fefce8;
   --managed: #059669;
   --managed-soft: #ecfdf5;
+  --cost: #0284c7;
+  --cost-high: #0369a1;
+  --cost-soft: #e0f2fe;
   --focus: #18181b;
   --topbar-bg: rgba(255, 255, 255, 0.9);
   --float-bg: rgba(255, 255, 255, 0.9);
@@ -261,6 +267,11 @@ input[type="search"] {
   color: var(--managed);
 }
 
+#cost-mode.active,
+.metrics .cost.active strong {
+  color: var(--cost-high);
+}
+
 #mode-cycle.active[aria-label="Risk"] {
   color: var(--critical);
 }
@@ -412,6 +423,10 @@ select {
   color: var(--critical);
 }
 
+.metrics .cost strong {
+  color: var(--cost);
+}
+
 .workspace {
   min-height: 0;
   display: grid;
@@ -558,6 +573,12 @@ select {
   border-color: rgba(255, 138, 61, 0.42);
   color: var(--high);
   background: var(--high-chip-bg);
+}
+
+.risk-chip.cost {
+  border-color: color-mix(in srgb, var(--cost) 42%, transparent);
+  color: var(--cost-high);
+  background: var(--cost-soft);
 }
 
 .risk-empty {
@@ -1438,6 +1459,56 @@ select {
 
 .provider-panel .json-details {
   border-top-color: var(--line);
+}
+
+.cost-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 2px;
+}
+
+.cost-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  padding: 8px;
+}
+
+.cost-row.active {
+  border-color: var(--cost);
+  background: var(--cost-soft);
+}
+
+.cost-row > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.cost-row > div:last-child {
+  justify-items: end;
+}
+
+.cost-row strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cost-row span {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  white-space: nowrap;
 }
 
 .object-list {

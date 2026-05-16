@@ -4,6 +4,7 @@ const state = {
   findingsRunId: null,
   cy: null,
   viewMode: "graph",
+  costMode: "off",
   groupBy: "environment",
   theme: "light",
   spreadMode: false,
@@ -24,6 +25,10 @@ const state = {
     open: false,
     index: 0,
     filtered: [],
+  },
+  costMax: {
+    estimated: 0,
+    actual: 0,
   },
   terminal: {
     instance: null,
@@ -75,6 +80,12 @@ const GROUP_FIELDS = {
   owner: { label: "Owner", filter: "owner", nodeValue: (node) => node.owner || "unowned" },
   severity: { label: "Severity", filter: "severity", nodeValue: (node) => node.severity || "none" },
   relationshipType: { label: "Relationship type", filter: null },
+};
+const COST_MODES = ["off", "estimated", "actual"];
+const COST_MODE_META = {
+  off: { label: "Cost overlay off", icon: "icon-cost" },
+  estimated: { label: "Estimated list-price cost", icon: "icon-cost" },
+  actual: { label: "Actual billed cost", icon: "icon-cost" },
 };
 const THEME_STORAGE_KEY = "cloudmapper.theme";
 const SEVERITY_META = {
@@ -138,6 +149,8 @@ function graphTheme() {
     nodeLabelBg: cssVar("--node-label-bg", "#050505"),
     edge: cssVar("--edge", "#4b5563"),
     overlay: cssVar("--overlay", "#fafafa"),
+    cost: cssVar("--cost", "#0ea5e9"),
+    costHigh: cssVar("--cost-high", "#0284c7"),
     critical: cssVar("--critical", "#ff5c5c"),
     high: cssVar("--high", "#ff8a3d"),
     medium: cssVar("--medium", "#f5c542"),
@@ -168,7 +181,29 @@ function nodeShellColor(data) {
   return serviceColor(data.service);
 }
 
+function activeNodeCost(data, mode = state.costMode) {
+  if (!mode || mode === "off") return null;
+  const cost = data.cost?.[mode];
+  return cost && Number(cost.monthlyUsd) > 0 ? cost : null;
+}
+
+function costIntensity(data) {
+  const cost = activeNodeCost(data);
+  if (!cost) return 0;
+  const max = state.costMax[state.costMode] || 0;
+  if (max <= 0) return 0;
+  return Math.max(0.08, Math.min(1, Math.sqrt(Number(cost.monthlyUsd) / max)));
+}
+
+function costRingColor(data, theme = graphTheme()) {
+  const intensity = costIntensity(data);
+  if (!intensity) return null;
+  return intensity > 0.66 ? theme.costHigh : theme.cost;
+}
+
 function nodeRingColor(data, theme = graphTheme()) {
+  const costColor = costRingColor(data, theme);
+  if (costColor) return costColor;
   if (data.severity === "critical") return theme.critical;
   if (data.severity === "high") return theme.high;
   if (data.severity === "medium") return theme.medium;
@@ -185,6 +220,8 @@ function nodeIconColor(data, theme = graphTheme()) {
 }
 
 function nodeSize(data) {
+  const intensity = costIntensity(data);
+  if (intensity) return Math.max(32, Math.round(30 + intensity * 24));
   if (data.severity === "critical") return 38;
   if (data.severity === "high") return 34;
   if (data.severity === "medium") return 32;
@@ -361,6 +398,8 @@ function renderGraph(payload) {
 
   populateServices(payload.summary.serviceCounts || []);
   populateFacets(payload.nodes || []);
+  updateCostBounds(payload.nodes || []);
+  syncCostControl();
   updateSummary(payload.summary);
   renderRiskSummary((payload.nodes || []).map((node) => node.data));
 
@@ -399,7 +438,7 @@ function renderGraph(payload) {
           "background-height": (ele) => nodeIconSize(ele.data()),
           "background-opacity": 1,
           "border-color": (ele) => nodeRingColor(ele.data(), theme),
-          "border-width": (ele) => ele.data("terraformAddress") || ele.data("severity") ? 2.6 : 1.5,
+          "border-width": (ele) => activeNodeCost(ele.data()) ? 4.2 : (ele.data("terraformAddress") || ele.data("severity") ? 2.6 : 1.5),
           "label": "data(label)",
           "font-size": 9,
           "font-weight": 600,
@@ -540,9 +579,31 @@ function updateSummary(summary) {
   $("#metric-edges").textContent = summary.relationships || 0;
   $("#metric-managed").textContent = summary.managedResources || 0;
   $("#metric-risk").textContent = (summary.criticalFindings || 0) + (summary.highFindings || 0);
+  updateCostMetric(summary);
   $("#graph-subtitle").textContent = summary.scanId ? shortText(summary.scanId, 34) : "no scan";
   $("#db-line").textContent = summary.accountId || "map.db";
   $("#scan-line").textContent = summary.collectedAt ? formatDate(summary.collectedAt) : "no scan";
+}
+
+function updateCostBounds(nodes) {
+  state.costMax = { estimated: 0, actual: 0 };
+  for (const node of nodes) {
+    for (const mode of ["estimated", "actual"]) {
+      const monthly = Number(node.data?.cost?.[mode]?.monthlyUsd || 0);
+      if (monthly > state.costMax[mode]) state.costMax[mode] = monthly;
+    }
+  }
+}
+
+function updateCostMetric(summary = state.graph?.summary || {}) {
+  const metric = $("#metric-cost");
+  const wrapper = metric?.closest("span");
+  if (!metric || !wrapper) return;
+  const mode = state.costMode === "actual" ? "actual" : "estimated";
+  const totals = summary.cost?.[mode] || {};
+  metric.textContent = formatCompactMoney(totals.monthlyUsd || 0);
+  wrapper.title = `${COST_MODE_META[mode].label}: ${formatMoney(totals.monthlyUsd || 0)}/mo`;
+  wrapper.classList.toggle("active", state.costMode !== "off");
 }
 
 function updateVisibleCount(visible, total) {
@@ -2404,6 +2465,12 @@ function renderRiskSummary(nodes = currentFilteredNodeData()) {
   if (highCount) {
     chips.push(riskChip(`${highCount} high`, { severity: "high" }, "high"));
   }
+  if (state.costMode !== "off") {
+    const cost = visibleCostTotal(nodes, state.costMode);
+    if (cost.monthlyUsd > 0) {
+      chips.push(`<button type="button" class="risk-chip cost" title="${escapeHtml(COST_MODE_META[state.costMode].label)}">${escapeHtml(formatCompactMoney(cost.monthlyUsd))}/mo</button>`);
+    }
+  }
 
   const environment = topRiskFacet(nodes, "environment");
   const application = topRiskFacet(nodes, "application");
@@ -2421,6 +2488,16 @@ function renderRiskSummary(nodes = currentFilteredNodeData()) {
   summaryPanel.innerHTML = chips.length
     ? chips.join("")
     : '<span class="risk-empty">no high risk</span>';
+}
+
+function visibleCostTotal(nodes, mode) {
+  return nodes.reduce((total, node) => {
+    const data = node.data || node;
+    total.monthlyUsd += Number(data.cost?.[mode]?.monthlyUsd || 0);
+    total.dailyUsd += Number(data.cost?.[mode]?.dailyUsd || 0);
+    total.hourlyUsd += Number(data.cost?.[mode]?.hourlyUsd || 0);
+    return total;
+  }, { hourlyUsd: 0, dailyUsd: 0, monthlyUsd: 0 });
 }
 
 function topRiskFacet(nodes, key) {
@@ -2538,6 +2615,7 @@ function showNode(data) {
       ${kv("finding", (data.findingTypes || []).join(", ") || "none")}
       ${kv("arn", data.arn || "n/a", data.arn)}
     </div>
+    ${costInspector(data)}
     ${providerInspector(data)}
     ${jsonDetails("Tags", data.tags)}
     ${jsonDetails("Attributes", data.attributes)}
@@ -2593,6 +2671,33 @@ function showFinding(finding) {
   `;
   if (state.focusMode === "blast") applyFilters();
   else renderCurrentView();
+}
+
+function costInspector(data) {
+  const costs = data.cost || {};
+  const rows = ["estimated", "actual"]
+    .map((mode) => [mode, costs[mode]])
+    .filter(([, cost]) => cost && Number(cost.monthlyUsd) >= 0)
+    .map(([mode, cost]) => `
+      <div class="cost-row ${mode === state.costMode ? "active" : ""}">
+        <div>
+          <strong>${escapeHtml(mode)}</strong>
+          <span>${escapeHtml(cost.confidence || "unknown")} confidence</span>
+        </div>
+        <div>
+          <span>${escapeHtml(formatMoney(cost.hourlyUsd || 0))}/h</span>
+          <span>${escapeHtml(formatMoney(cost.dailyUsd || 0))}/d</span>
+          <span>${escapeHtml(formatMoney(cost.monthlyUsd || 0))}/mo</span>
+        </div>
+      </div>
+    `);
+  if (!rows.length) return "";
+  const notes = ["estimated", "actual"]
+    .flatMap((mode) => (costs[mode]?.notes || []).map((note) => `${mode}: ${note}`));
+  return inspectorPanel("Cost", `
+    <div class="cost-list">${rows.join("")}</div>
+    ${notes.length ? objectList("Notes", notes.slice(0, 6)) : ""}
+  `);
 }
 
 function providerInspector(data) {
@@ -2772,6 +2877,22 @@ function formatDate(value) {
   });
 }
 
+function formatMoney(value) {
+  const number = Number(value || 0);
+  return `$${number.toLocaleString("en-US", {
+    minimumFractionDigits: number >= 10 ? 0 : 2,
+    maximumFractionDigits: number >= 10 ? 0 : 2,
+  })}`;
+}
+
+function formatCompactMoney(value) {
+  const number = Number(value || 0);
+  if (number >= 1_000_000) return `$${(number / 1_000_000).toFixed(1)}M`;
+  if (number >= 1_000) return `$${(number / 1_000).toFixed(1)}K`;
+  if (number >= 10) return `$${Math.round(number)}`;
+  return `$${number.toFixed(2)}`;
+}
+
 function shortText(value, maxLength) {
   const text = String(value);
   if (text.length <= maxLength) return text;
@@ -2819,6 +2940,35 @@ function syncViewControls() {
   document.querySelectorAll(".view-button[data-view]").forEach((button) => {
     button.classList.toggle("active", button.dataset.view === state.viewMode);
   });
+}
+
+function cycleCostMode() {
+  const index = COST_MODES.indexOf(state.costMode);
+  const next = COST_MODES[(Math.max(0, index) + 1) % COST_MODES.length];
+  setCostMode(next);
+}
+
+function setCostMode(mode) {
+  state.costMode = COST_MODES.includes(mode) ? mode : "off";
+  syncCostControl();
+  updateCostMetric();
+  if (state.cy) {
+    state.cy.style().update();
+  }
+  renderRiskSummary();
+  renderCurrentView();
+  updateUrlFromFilters();
+}
+
+function syncCostControl() {
+  const button = $("#cost-mode");
+  if (!button) return;
+  const meta = COST_MODE_META[state.costMode] || COST_MODE_META.off;
+  button.title = meta.label;
+  button.setAttribute("aria-label", meta.label);
+  button.innerHTML = iconSvg(meta.icon);
+  button.classList.toggle("active", state.costMode !== "off");
+  button.dataset.costMode = state.costMode;
 }
 
 function cycleViewMode() {
@@ -3169,6 +3319,9 @@ function commandList() {
     })),
     { id: "findings-only", label: state.filters.findingsOnly ? "All resources" : "Findings only", hint: "", icon: "icon-finding", run: () => toggleFilter("findingsOnly") },
     { id: "terraform-only", label: state.filters.managedOnly ? "All management states" : "Terraform only", hint: "", icon: "icon-managed", run: () => toggleFilter("managedOnly") },
+    { id: "cost-off", label: "Cost overlay: Off", hint: "$", icon: "icon-cost", run: () => setCostMode("off") },
+    { id: "cost-estimated", label: "Cost overlay: Estimated", hint: "$", icon: "icon-cost", run: () => setCostMode("estimated") },
+    { id: "cost-actual", label: "Cost overlay: Actual", hint: "$", icon: "icon-cost", run: () => setCostMode("actual") },
     { id: "layout-layers", label: "Layout: Layers", hint: "", icon: "icon-relation", run: () => setLayout("breadthfirst") },
     { id: "layout-force", label: "Layout: Force", hint: "", icon: "icon-relation", run: () => setLayout("cose") },
     { id: "layout-circle", label: "Layout: Circle", hint: "", icon: "icon-relation", run: () => setLayout("circle") },
@@ -3260,7 +3413,24 @@ function compactNode(data) {
     terraform_address: data.terraformAddress || null,
     severity: data.severity || null,
     finding_types: data.findingTypes || [],
+    cost: compactCost(data.cost),
   };
+}
+
+function compactCost(costs = {}) {
+  const compact = {};
+  for (const mode of ["estimated", "actual"]) {
+    const cost = costs[mode];
+    if (!cost) continue;
+    compact[mode] = {
+      hourly_usd: cost.hourlyUsd || 0,
+      daily_usd: cost.dailyUsd || 0,
+      monthly_usd: cost.monthlyUsd || 0,
+      confidence: cost.confidence || null,
+      source: cost.source || null,
+    };
+  }
+  return compact;
 }
 
 function compactFinding(finding) {
@@ -3460,6 +3630,7 @@ function bindControls() {
   $("#layout").addEventListener("change", (event) => runLayout(event.target.value));
   $("#fit").addEventListener("click", fitGraph);
   $("#spread").addEventListener("click", toggleSpreadMode);
+  $("#cost-mode").addEventListener("click", cycleCostMode);
   $("#reset")?.addEventListener("click", resetView);
   $("#agent-copy").addEventListener("click", copyAgentContext);
   $("#theme-toggle").addEventListener("click", toggleTheme);
@@ -3564,6 +3735,8 @@ function loadFiltersFromUrl() {
   state.viewMode = VIEW_MODES.includes(view) ? view : "graph";
   const group = params.get("group") || "environment";
   state.groupBy = GROUP_FIELDS[group] ? group : "environment";
+  const cost = params.get("cost") || "off";
+  state.costMode = COST_MODES.includes(cost) ? cost : "off";
   state.spreadMode = params.get("spread") === "1";
   state.panels.inspector = params.get("inspector") !== "0";
   state.panels.findings = params.get("findingsPanel") !== "0";
@@ -3582,6 +3755,7 @@ function syncControlsFromState() {
   $("#managed-only").checked = state.filters.managedOnly;
   syncModeControls();
   syncViewControls();
+  syncCostControl();
   syncSpreadControl();
   syncPanelLayout({ refresh: false });
 }
@@ -3601,6 +3775,7 @@ function updateUrlFromFilters() {
   if (state.focusMode !== "all") params.set("mode", state.focusMode);
   if (state.viewMode !== "graph") params.set("view", state.viewMode);
   if (state.groupBy !== "environment") params.set("group", state.groupBy);
+  if (state.costMode !== "off") params.set("cost", state.costMode);
   if (state.spreadMode) params.set("spread", "1");
   if (!state.panels.inspector) params.set("inspector", "0");
   if (!state.panels.findings) params.set("findingsPanel", "0");
@@ -3661,6 +3836,8 @@ function handleKeyboard(event) {
     togglePanel("findings");
   } else if (event.key.toLowerCase() === "s") {
     toggleSpreadMode();
+  } else if (event.key === "$") {
+    cycleCostMode();
   } else if (event.key.toLowerCase() === "r") {
     resetView();
   } else if (event.key.toLowerCase() === "m") {

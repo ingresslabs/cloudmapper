@@ -1,6 +1,7 @@
 mod agent_export;
 mod aws_scan;
 mod compare;
+mod cost;
 mod db;
 mod demo;
 mod k8s_demo;
@@ -20,6 +21,9 @@ use tracing_subscriber::FmtSubscriber;
 use crate::agent_export::{AgentExportOptions, export_agent_bundle};
 use crate::aws_scan::{ScanOptions, scan_account};
 use crate::compare::compare_infra;
+use crate::cost::{
+    CostActualOptions, default_cost_metric, import_actual_costs, write_estimated_costs,
+};
 use crate::demo::write_demo_bundle;
 use crate::k8s_demo::write_k8s_demo_bundle;
 use crate::k8s_scan::{K8sScanOptions, scan_cluster, write_k8s_findings};
@@ -56,6 +60,11 @@ enum Command {
     Terraform {
         #[command(subcommand)]
         command: TerraformCommand,
+    },
+    /// Calculate estimated and actual resource cost overlays.
+    Cost {
+        #[command(subcommand)]
+        command: CostCommand,
     },
     /// Serve a local Cytoscape infrastructure graph UI.
     Ui(UiArgs),
@@ -242,6 +251,56 @@ struct TerraformExportArgs {
     /// Output file. If omitted, JSON is printed to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum CostCommand {
+    /// Recalculate estimated list-price costs from resources in map.db.
+    Estimate(CostEstimateArgs),
+    /// Import actual billed costs from AWS Cost Explorer and allocation tags.
+    Actual(CostActualArgs),
+}
+
+#[derive(Debug, Parser)]
+struct CostEstimateArgs {
+    /// Map database path.
+    #[arg(long, default_value = "infra/map.db")]
+    db: PathBuf,
+
+    /// AWS scan id. Defaults to the latest scan in the database.
+    #[arg(long)]
+    scan_id: Option<String>,
+}
+
+#[derive(Debug, Parser)]
+struct CostActualArgs {
+    /// Map database path.
+    #[arg(long, default_value = "infra/map.db")]
+    db: PathBuf,
+
+    /// AWS scan id. Defaults to the latest scan in the database.
+    #[arg(long)]
+    scan_id: Option<String>,
+
+    /// AWS profile name. Falls back to AWS_PROFILE or the default credential chain.
+    #[arg(long)]
+    profile: Option<String>,
+
+    /// Billing API region for Cost Explorer.
+    #[arg(long, default_value = "us-east-1")]
+    billing_region: String,
+
+    /// Number of trailing days to read from Cost Explorer.
+    #[arg(long, default_value_t = 30)]
+    days: i64,
+
+    /// Cost allocation tag key. May be repeated or comma-separated.
+    #[arg(long = "tag", value_delimiter = ',', default_values = ["Environment", "Application", "Owner", "Name"])]
+    tags: Vec<String>,
+
+    /// Cost Explorer metric to import.
+    #[arg(long, default_value_t = default_cost_metric().to_string())]
+    metric: String,
 }
 
 #[derive(Debug, Parser)]
@@ -458,6 +517,51 @@ async fn run() -> Result<()> {
                 } else {
                     println!("{json}");
                 }
+            }
+        },
+        Command::Cost { command } => match command {
+            CostCommand::Estimate(args) => {
+                let summary = write_estimated_costs(&args.db, args.scan_id.as_deref())?;
+                println!(
+                    "wrote estimated list-price costs for {}/{} resources in {} ({:.2} USD/month)",
+                    summary.costed_resources,
+                    summary.resources,
+                    summary.scan_id,
+                    summary.monthly_usd
+                );
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    args.db.display()
+                );
+            }
+            CostCommand::Actual(args) => {
+                let summary = import_actual_costs(CostActualOptions {
+                    db: args.db.clone(),
+                    scan_id: args.scan_id,
+                    profile: args.profile,
+                    billing_region: args.billing_region,
+                    days: args.days,
+                    tags: args.tags,
+                    metric: args.metric,
+                })
+                .await?;
+                println!(
+                    "wrote actual Cost Explorer cost overlay for {}/{} resources in {} ({:.2} USD/month run rate)",
+                    summary.costed_resources,
+                    summary.resources,
+                    summary.scan_id,
+                    summary.monthly_usd
+                );
+                println!(
+                    "period: {} to {} grouped by tags: {}",
+                    summary.period_start,
+                    summary.period_end,
+                    summary.tags.join(", ")
+                );
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    args.db.display()
+                );
             }
         },
         Command::Ui(args) => {
