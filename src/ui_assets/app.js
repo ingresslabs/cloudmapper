@@ -708,6 +708,14 @@ function renderCurrentView() {
     renderCostAnalytics();
     return;
   }
+  if (state.viewMode === "drift") {
+    renderDriftView();
+    return;
+  }
+  if (state.viewMode === "remediation") {
+    renderRemediationView();
+    return;
+  }
   renderD3Placeholder(VIEW_MODE_META[state.viewMode] || VIEW_MODE_META.graph);
 }
 
@@ -1348,9 +1356,10 @@ function filteredFindingList(nodes = currentFilteredNodeData()) {
 
 function findingMatchesNodeScope(finding, visibleIds) {
   if (state.filters.severity && finding.severity !== state.filters.severity) return false;
+  if (!hasActiveGraphFilters()) return true;
   const relatedIds = findingRelatedNodeIds(finding);
   if (relatedIds.length) return relatedIds.some((id) => visibleIds.has(id));
-  return !hasActiveGraphFilters();
+  return false;
 }
 
 function findingRelatedNodeIds(finding) {
@@ -2792,6 +2801,255 @@ function showCostGroupSelection(group, model) {
   `;
 }
 
+function renderDriftView() {
+  const container = $("#d3-view");
+  const model = buildDriftData();
+  if (!model.visibleResources) {
+    container.innerHTML = emptyState("No matching resources", "Current filters hide every resource.");
+    return;
+  }
+  if (!model.findings.length) {
+    container.innerHTML = emptyState("No drift findings", "Current filters do not expose Terraform drift, unmanaged resources, or state-only resources.");
+    return;
+  }
+
+  container.innerHTML = `
+    <div class="d3-layer drift-view">
+      <div class="d3-view-header">
+        <span class="d3-view-title">Drift</span>
+        <div class="d3-view-stats">
+          <span><strong>${model.findings.length}</strong> findings</span>
+          <span><strong>${model.unmanaged}</strong> unmanaged</span>
+          <span><strong>${model.stateOnly}</strong> state-only</span>
+          <span><strong>${escapeHtml(formatMoney(model.monthlyDelta))}</strong>/mo impact</span>
+        </div>
+      </div>
+      <div class="drift-grid">
+        <section class="drift-summary-grid">
+          ${driftMetricCard("Cost impact", `${formatMoney(model.monthlyDelta)}/mo`, "estimated delta")}
+          ${driftMetricCard("Terraform drift", model.attributeDrift, "attribute mismatches")}
+          ${driftMetricCard("Unmanaged", model.unmanaged, "AWS-only resources")}
+          ${driftMetricCard("Mapped", model.terraformMapped, "with Terraform address")}
+        </section>
+        <section class="drift-list">
+          ${model.findings.map(driftFindingRow).join("")}
+        </section>
+        <section class="drift-detail-panel">
+          ${driftDetailHtml(model.primary)}
+        </section>
+      </div>
+    </div>
+  `;
+  bindFindingViewRows(container, model.findings);
+}
+
+function renderRemediationView() {
+  const container = $("#d3-view");
+  const model = buildRemediationData();
+  if (!model.visibleResources) {
+    container.innerHTML = emptyState("No matching resources", "Current filters hide every resource.");
+    return;
+  }
+  if (!model.findings.length) {
+    container.innerHTML = emptyState("No remediation queue", "Current filters do not expose persisted findings.");
+    return;
+  }
+
+  container.innerHTML = `
+    <div class="d3-layer remediation-view">
+      <div class="d3-view-header">
+        <span class="d3-view-title">Remediation</span>
+        <div class="d3-view-stats">
+          <span><strong>${model.findings.length}</strong> actions</span>
+          <span><strong>${model.terraformActions}</strong> Terraform</span>
+          <span><strong>${model.importActions}</strong> import/delete</span>
+          <span><strong>${escapeHtml(formatMoney(model.monthlyDelta))}</strong>/mo recoverable</span>
+        </div>
+      </div>
+      <div class="remediation-board">
+        ${model.findings.map(remediationStep).join("")}
+      </div>
+    </div>
+  `;
+  bindFindingViewRows(container, model.findings);
+}
+
+function buildDriftData() {
+  const nodes = currentFilteredNodeData();
+  const findings = filteredFindingList(nodes).filter(isDriftFinding).sort(compareDriftFindings);
+  const monthlyDelta = findings.reduce((sum, finding) => sum + Math.max(0, driftCostDelta(finding)), 0);
+  return {
+    visibleResources: nodes.length,
+    findings,
+    primary: findings[0] || null,
+    monthlyDelta,
+    attributeDrift: findings.filter((finding) => finding.finding_type.includes("drift")).length,
+    unmanaged: findings.filter((finding) => finding.finding_type.startsWith("unmanaged_")).length,
+    stateOnly: findings.filter((finding) => finding.finding_type === "state_only_resource").length,
+    terraformMapped: findings.filter((finding) => finding.terraform_address).length,
+  };
+}
+
+function buildRemediationData() {
+  const nodes = currentFilteredNodeData();
+  const findings = filteredFindingList(nodes).sort(compareDriftFindings);
+  const monthlyDelta = findings.reduce((sum, finding) => sum + Math.max(0, driftCostDelta(finding)), 0);
+  return {
+    visibleResources: nodes.length,
+    findings,
+    monthlyDelta,
+    terraformActions: findings.filter((finding) => remediationKind(finding).terraform).length,
+    importActions: findings.filter((finding) => remediationKind(finding).kind === "import").length,
+  };
+}
+
+function isDriftFinding(finding) {
+  const type = finding.finding_type || "";
+  return type.includes("drift")
+    || type.startsWith("unmanaged_")
+    || type === "unmanaged_resource"
+    || type === "state_only_resource";
+}
+
+function compareDriftFindings(left, right) {
+  return severityRank(right.severity) - severityRank(left.severity)
+    || Math.abs(driftCostDelta(right)) - Math.abs(driftCostDelta(left))
+    || compareFindings(left, right);
+}
+
+function driftFindingRow(finding, index) {
+  const node = finding.aws_uid ? nodeById(finding.aws_uid) : null;
+  const delta = driftCostDelta(finding);
+  return `
+    <button type="button" class="drift-row severity-${escapeHtml(finding.severity)}" data-finding-index="${index}">
+      <span class="severity-dot ${escapeHtml(finding.severity)}"></span>
+      <span>
+        <strong>${escapeHtml(node?.label || finding.terraform_address || finding.aws_uid || finding.id)}</strong>
+        <small>${escapeHtml(driftKindLabel(finding))} · ${escapeHtml(driftValueLabel(finding))}</small>
+      </span>
+      <b>${delta ? escapeHtml(costValueLabel(delta, "month", true)) : ""}</b>
+    </button>
+  `;
+}
+
+function remediationStep(finding, index) {
+  const kind = remediationKind(finding);
+  const node = finding.aws_uid ? nodeById(finding.aws_uid) : null;
+  const delta = driftCostDelta(finding);
+  return `
+    <button type="button" class="remediation-step severity-${escapeHtml(finding.severity)}" data-finding-index="${index}">
+      <span class="remediation-rank">${index + 1}</span>
+      <span class="severity-dot ${escapeHtml(finding.severity)}"></span>
+      <span class="remediation-main">
+        <strong>${escapeHtml(kind.label)}</strong>
+        <small>${escapeHtml(node?.label || finding.terraform_address || finding.aws_uid || finding.id)}</small>
+        <em>${escapeHtml(finding.recommended_action || "")}</em>
+      </span>
+      <span class="remediation-meta">
+        <b>${escapeHtml(finding.severity)}</b>
+        <small>${delta > 0 ? `${escapeHtml(formatMoney(delta))}/mo` : escapeHtml(driftKindLabel(finding))}</small>
+      </span>
+    </button>
+  `;
+}
+
+function driftMetricCard(label, value, detail) {
+  return `
+    <div class="drift-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(String(value))}</strong>
+      <small>${escapeHtml(detail)}</small>
+    </div>
+  `;
+}
+
+function driftDetailHtml(finding) {
+  if (!finding) return emptyState("No drift selected", "Select a finding to inspect its evidence and remediation.");
+  const node = finding.aws_uid ? nodeById(finding.aws_uid) : null;
+  return `
+    <div class="drift-detail-title">${escapeHtml(node?.label || finding.terraform_address || finding.aws_uid || finding.id)}</div>
+    <div class="selected-meta">${escapeHtml(finding.reason)}</div>
+    <div class="kv compact">
+      ${kv("type", finding.finding_type)}
+      ${kv("severity", finding.severity)}
+      ${kv("terraform", finding.terraform_address || "n/a", finding.terraform_address)}
+      ${kv("resource", finding.aws_uid || "n/a", finding.aws_uid)}
+      ${kv("cost delta", costValueLabel(driftCostDelta(finding), "month", true))}
+      ${kv("change", driftValueLabel(finding))}
+    </div>
+    ${objectList("Action", [finding.recommended_action])}
+    ${jsonDetails("Attributes", finding.attributes)}
+  `;
+}
+
+function bindFindingViewRows(container, findings) {
+  container.querySelectorAll("[data-finding-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const finding = findings[Number(button.dataset.findingIndex)];
+      if (finding) selectFinding(finding);
+    });
+  });
+}
+
+function selectFinding(finding) {
+  state.atlasSelection = null;
+  state.attackSelection = null;
+  showFinding(finding);
+  if (finding.aws_uid && state.cy) {
+    const node = state.cy.getElementById(finding.aws_uid);
+    if (node.length) {
+      state.cy.elements().unselect();
+      node.select();
+      if (state.viewMode === "graph") {
+        state.cy.animate({ center: { eles: node }, zoom: Math.max(state.cy.zoom(), 1.1) }, { duration: 250 });
+      }
+    }
+  }
+}
+
+function driftCostDelta(finding) {
+  const cost = finding.attributes?.cost || {};
+  const value = cost.estimated_delta_monthly_usd
+    ?? cost.monthly_delta_usd
+    ?? cost.estimated_current_monthly_usd
+    ?? 0;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function driftKindLabel(finding) {
+  const type = finding.finding_type || "";
+  if (type === "terraform_instance_type_drift") return "Instance type drift";
+  if (type === "state_only_resource") return "State-only Terraform";
+  if (type === "unmanaged_public_resource") return "Unmanaged public resource";
+  if (type === "unmanaged_resource") return "Unmanaged resource";
+  if (type === "terraform_owned_public_ingress") return "Terraform exposure";
+  return type.replaceAll("_", " ");
+}
+
+function driftValueLabel(finding) {
+  const drift = finding.attributes?.drift;
+  if (drift?.attribute) {
+    return `${drift.attribute}: ${drift.terraform_value ?? "n/a"} -> ${drift.aws_value ?? "n/a"}`;
+  }
+  if (finding.finding_type?.startsWith("unmanaged_") || finding.finding_type === "unmanaged_resource") {
+    return "AWS resource absent from Terraform state";
+  }
+  if (finding.finding_type === "state_only_resource") {
+    return "Terraform state target absent from scan";
+  }
+  return finding.reason || finding.finding_type || "finding";
+}
+
+function remediationKind(finding) {
+  const type = finding.finding_type || "";
+  if (type.includes("drift")) return { kind: "terraform", terraform: true, label: "Reconcile Terraform drift" };
+  if (type === "terraform_owned_public_ingress") return { kind: "terraform", terraform: true, label: "Restrict Terraform ingress" };
+  if (type.startsWith("unmanaged_") || type === "unmanaged_resource") return { kind: "import", terraform: false, label: "Import or delete AWS resource" };
+  if (type === "state_only_resource") return { kind: "refresh", terraform: true, label: "Refresh or remove state" };
+  return { kind: "review", terraform: Boolean(finding.terraform_address), label: "Review finding" };
+}
+
 function buildGroupLaneData(groupBy) {
   return groupBy === "relationshipType" ? relationshipGroups() : nodeGroups(groupBy);
 }
@@ -3166,19 +3424,7 @@ function renderFindingList(nodes = currentFilteredNodeData()) {
   container.querySelectorAll(".finding-item").forEach((item) => {
     item.addEventListener("click", () => {
       const finding = findings[Number(item.dataset.index)];
-      state.atlasSelection = null;
-      state.attackSelection = null;
-      showFinding(finding);
-      if (finding.aws_uid && state.cy) {
-        const node = state.cy.getElementById(finding.aws_uid);
-        if (node.length) {
-          state.cy.elements().unselect();
-          node.select();
-          if (state.viewMode === "graph") {
-            state.cy.animate({ center: { eles: node }, zoom: Math.max(state.cy.zoom(), 1.1) }, { duration: 250 });
-          }
-        }
-      }
+      selectFinding(finding);
     });
   });
 }

@@ -37,6 +37,13 @@ make demo
 make demo-ui
 ```
 
+Run the compact AWS drift and cost demo without credentials:
+
+```bash
+make demo-aws-drift
+make demo-aws-drift-ui
+```
+
 Run the Kubernetes demo without a cluster:
 
 ```bash

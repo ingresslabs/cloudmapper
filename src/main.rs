@@ -26,7 +26,7 @@ use crate::compare::compare_infra;
 use crate::cost::{
     CostActualOptions, default_cost_metric, import_actual_costs, write_estimated_costs,
 };
-use crate::demo::write_demo_bundle;
+use crate::demo::{write_aws_drift_demo_bundle, write_demo_bundle};
 use crate::k8s_demo::write_k8s_demo_bundle;
 use crate::k8s_scan::{K8sScanOptions, scan_cluster, write_k8s_findings};
 use crate::terraform_state::{export_terraform_state, import_terraform_state_file};
@@ -49,7 +49,7 @@ enum Command {
         #[command(subcommand)]
         command: ScanCommand,
     },
-    /// Write a zero-AWS large-org demo bundle with Terraform state and findings.
+    /// Write a zero-credential demo bundle with Terraform state and findings.
     Demo(DemoArgs),
     /// Compare AWS reality with imported Terraform state and emit findings.
     Compare(CompareArgs),
@@ -150,7 +150,7 @@ struct DemoArgs {
     #[arg(long, value_enum, default_value_t = DemoProvider::Aws)]
     provider: DemoProvider,
 
-    /// Directory for the generated large-org demo infrastructure bundle.
+    /// Directory for the generated demo infrastructure bundle.
     #[arg(long, default_value = "infra")]
     out: PathBuf,
 
@@ -162,6 +162,7 @@ struct DemoArgs {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum DemoProvider {
     Aws,
+    AwsDrift,
     K8s,
 }
 
@@ -470,6 +471,39 @@ async fn run() -> Result<()> {
                 ));
                 println!(
                     "wrote AWS large-org demo bundle with {} resources, {} relationships, and {} findings to {}",
+                    summary.resources,
+                    summary.relationships,
+                    summary.findings,
+                    summary.out.display()
+                );
+                println!(
+                    "terraform: {} ({})",
+                    summary.state_path.display(),
+                    summary.terraform_state_id
+                );
+                println!("findings: {}", summary.findings_path.display());
+                println!(
+                    "next: cloudmapper ui --db {} --bind 127.0.0.1:8765",
+                    summary.db_path.display()
+                );
+            }
+            DemoProvider::AwsDrift => {
+                let progress = IngestAnimation::start("demo aws drift", args.out.join("map.db"));
+                progress.stage("generating AWS drift demo inventory");
+                let summary = match write_aws_drift_demo_bundle(&args.out, args.allow_non_empty_out)
+                {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        progress.fail();
+                        return Err(error);
+                    }
+                };
+                progress.finish(format!(
+                    "{} resources, {} relationships, {} findings",
+                    summary.resources, summary.relationships, summary.findings
+                ));
+                println!(
+                    "wrote AWS drift demo bundle with {} resources, {} relationships, and {} findings to {}",
                     summary.resources,
                     summary.relationships,
                     summary.findings,

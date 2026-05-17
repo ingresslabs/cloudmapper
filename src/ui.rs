@@ -1093,7 +1093,7 @@ mod tests {
 
     use crate::compare::compare_infra;
     use crate::db::write_inventory_db;
-    use crate::demo::write_demo_bundle;
+    use crate::demo::{write_aws_drift_demo_bundle, write_demo_bundle};
     use crate::model::{Generator, Inventory, Resource, SCHEMA_VERSION};
 
     use super::*;
@@ -1181,6 +1181,35 @@ mod tests {
     }
 
     #[test]
+    fn aws_drift_demo_graph_payload_exposes_costed_drift() {
+        let temp = tempdir().unwrap();
+        let summary = write_aws_drift_demo_bundle(temp.path(), false).unwrap();
+
+        let graph = load_graph(&summary.db_path).unwrap();
+        let findings = load_findings(&summary.db_path).unwrap();
+
+        assert_eq!(graph.summary.resources, 5);
+        assert_eq!(graph.summary.relationships, 6);
+        assert_eq!(graph.summary.managed_resources, 4);
+        assert_eq!(graph.summary.findings, 2);
+        assert_eq!(findings.findings.len(), 2);
+        assert!(findings.findings.iter().any(|finding| {
+            finding.finding_type == "terraform_instance_type_drift"
+                && finding.attributes["cost"]["estimated_delta_monthly_usd"]
+                    .as_f64()
+                    .is_some_and(|value| value > 200.0)
+        }));
+        assert!(graph.nodes.iter().any(|node| {
+            node.data.label == "prod-cost-leak-01"
+                && node
+                    .data
+                    .cost
+                    .get("estimated")
+                    .is_some_and(|cost| cost.monthly_usd > 200.0)
+        }));
+    }
+
+    #[test]
     fn k8s_graph_payload_exposes_provider_facets() {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("map.db");
@@ -1219,6 +1248,8 @@ mod tests {
         assert!(INDEX_HTML.contains("class=\"graph-header\""));
         assert!(INDEX_HTML.contains("data-view=\"mission\""));
         assert!(INDEX_HTML.contains("data-view=\"cost\""));
+        assert!(INDEX_HTML.contains("data-view=\"drift\""));
+        assert!(INDEX_HTML.contains("data-view=\"remediation\""));
         assert!(INDEX_HTML.contains("/xterm.css"));
         assert!(INDEX_HTML.contains("/xterm.js"));
         assert!(INDEX_HTML.contains("icon-spread"));
@@ -1229,12 +1260,16 @@ mod tests {
         assert!(APP_CSS.contains("#spread.active"));
         assert!(APP_CSS.contains(".cost-row.active"));
         assert!(APP_CSS.contains(".cost-analytics-grid"));
+        assert!(APP_CSS.contains(".drift-view"));
+        assert!(APP_CSS.contains(".remediation-view"));
         assert!(APP_CSS.contains(".mission-terminal"));
         assert!(APP_CSS.contains(".workspace.hide-inspector"));
         assert!(APP_CSS.contains(".workspace.hide-findings"));
         assert!(APP_JS.contains("function spreadGraph()"));
         assert!(APP_JS.contains("function setCostMode"));
         assert!(APP_JS.contains("function renderCostAnalytics()"));
+        assert!(APP_JS.contains("function renderDriftView()"));
+        assert!(APP_JS.contains("function renderRemediationView()"));
         assert!(APP_JS.contains("COST_BASIS"));
         assert!(APP_JS.contains("function renderMissionTerminal()"));
         assert!(APP_JS.contains("function toggleSpreadMode()"));

@@ -176,7 +176,7 @@ pub fn estimate_resource_cost(resource: &Resource) -> Option<ResourceCost> {
                 ));
             }
             let instance_type = string_attr(&resource.attributes, "instance_type")?;
-            let hourly = ec2_instance_hourly(&instance_type)? * region_multiplier;
+            let hourly = estimate_ec2_instance_hourly(&instance_type, &resource.region)?;
             notes.push(format!("On-demand Linux EC2 baseline for {instance_type}."));
             Some(cost_from_hourly(
                 resource,
@@ -474,6 +474,10 @@ fn cost_explorer_services(resource: &Resource) -> &'static [&'static str] {
         ("kms", _) => &["AWS Key Management Service"],
         _ => &[],
     }
+}
+
+pub fn estimate_ec2_instance_hourly(instance_type: &str, region: &str) -> Option<f64> {
+    Some(ec2_instance_hourly(instance_type)? * region_price_multiplier(region))
 }
 
 fn load_resources(connection: &Connection, scan_id: &str) -> Result<Vec<Resource>> {

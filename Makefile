@@ -2,11 +2,12 @@ SHELL := /usr/bin/env bash
 
 CARGO_ENV ?= CARGO_PROFILE_DEV_DEBUG=0 CARGO_BUILD_JOBS=1
 DEMO_OUT ?= infra
+AWS_DRIFT_DEMO_OUT ?= infra-aws-drift
 K8S_DEMO_OUT ?= infra-k8s
 DB ?= $(DEMO_OUT)/map.db
 BIND ?= 127.0.0.1:8765
 
-.PHONY: help fmt clippy check build buld test demo demo-k8s ui demo-ui demo-k8s-ui loc clean
+.PHONY: help fmt clippy check build buld test demo demo-aws-drift demo-k8s ui demo-ui demo-aws-drift-ui demo-k8s-ui loc clean
 
 help:
 	@printf 'cloudmapper Make targets\n\n'
@@ -16,14 +17,17 @@ help:
 	@printf '  make fmt         Check Rust formatting\n'
 	@printf '  make clippy      Run Rust lints\n'
 	@printf '  make demo        Build a zero-AWS large-org demo infra/ bundle\n'
+	@printf '  make demo-aws-drift Build a compact AWS drift and cost demo bundle\n'
 	@printf '  make demo-k8s    Build a zero-cluster Kubernetes demo bundle\n'
 	@printf '  make ui          Serve the local Cytoscape UI\n'
 	@printf '  make demo-ui     Build the demo bundle and serve it\n'
+	@printf '  make demo-aws-drift-ui Build the AWS drift demo bundle and serve it\n'
 	@printf '  make demo-k8s-ui Build the Kubernetes demo bundle and serve it\n'
 	@printf '  make loc         Count lines in source files\n'
 	@printf '  make clean       Remove Cargo build output\n\n'
 	@printf 'Options:\n'
 	@printf '  DEMO_OUT=%s\n' '$(DEMO_OUT)'
+	@printf '  AWS_DRIFT_DEMO_OUT=%s\n' '$(AWS_DRIFT_DEMO_OUT)'
 	@printf '  K8S_DEMO_OUT=%s\n' '$(K8S_DEMO_OUT)'
 	@printf '  DB=%s\n' '$(DB)'
 	@printf '  BIND=%s\n' '$(BIND)'
@@ -51,6 +55,9 @@ test:
 demo:
 	$(CARGO_ENV) cargo run -- demo --out "$(DEMO_OUT)"
 
+demo-aws-drift:
+	$(CARGO_ENV) cargo run -- demo --provider aws-drift --out "$(AWS_DRIFT_DEMO_OUT)"
+
 demo-k8s:
 	$(CARGO_ENV) cargo run -- demo --provider k8s --out "$(K8S_DEMO_OUT)"
 
@@ -59,6 +66,9 @@ ui:
 
 demo-ui: demo
 	$(CARGO_ENV) cargo run -- ui --db "$(DEMO_OUT)/map.db" --bind "$(BIND)"
+
+demo-aws-drift-ui: demo-aws-drift
+	$(CARGO_ENV) cargo run -- ui --db "$(AWS_DRIFT_DEMO_OUT)/map.db" --bind "$(BIND)"
 
 demo-k8s-ui: demo-k8s
 	$(CARGO_ENV) cargo run -- ui --db "$(K8S_DEMO_OUT)/map.db" --bind "$(BIND)"

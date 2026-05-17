@@ -7,8 +7,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::cost::estimate_resource_cost;
 use crate::db::{latest_terraform_state_id, open_cloudmapper_db};
-use crate::model::SCHEMA_VERSION;
+use crate::model::{Resource, SCHEMA_VERSION};
 
 #[derive(Debug, Serialize)]
 pub struct CompareReport {
@@ -51,19 +52,26 @@ pub enum Severity {
 #[derive(Clone)]
 struct AwsResource {
     uid: String,
+    provider: String,
+    account_id: String,
+    partition: String,
+    region: String,
     service: String,
     resource_type: String,
     id: String,
     arn: Option<String>,
     name: Option<String>,
+    tags: BTreeMap<String, String>,
     attributes: Value,
     evidence: Vec<Value>,
 }
 
+#[derive(Clone)]
 struct TerraformResource {
     address: String,
     resource_type: String,
     aws_uid: Option<String>,
+    attributes: Value,
 }
 
 pub fn compare_infra(
@@ -102,15 +110,18 @@ fn compare_connection(
             resource
                 .aws_uid
                 .as_ref()
-                .map(|uid| (uid.clone(), resource.address.clone()))
+                .map(|uid| (uid.clone(), resource.clone()))
         })
         .collect::<BTreeMap<_, _>>();
     let aws_uids = aws_resources.keys().cloned().collect::<BTreeSet<_>>();
 
     let mut findings = Vec::new();
     for resource in aws_resources.values() {
-        if terraform_by_uid.contains_key(&resource.uid) {
-            if let Some(finding) = terraform_owned_public_ingress(resource, &terraform_by_uid) {
+        if let Some(terraform_resource) = terraform_by_uid.get(&resource.uid) {
+            if let Some(finding) = terraform_owned_public_ingress(resource, terraform_resource) {
+                findings.push(finding);
+            }
+            if let Some(finding) = costed_instance_type_drift(resource, terraform_resource) {
                 findings.push(finding);
             }
             continue;
@@ -159,21 +170,28 @@ fn load_aws_resources(
 ) -> Result<BTreeMap<String, AwsResource>> {
     let mut statement = connection.prepare(
         r#"
-        SELECT uid, service, resource_type, resource_id, arn, name, attributes_json, evidence_json
+        SELECT uid, provider, account_id, partition, region, service, resource_type,
+               resource_id, arn, name, tags_json, attributes_json, evidence_json
         FROM resources
         WHERE scan_id = ?1
         "#,
     )?;
     let rows = statement.query_map(params![scan_id], |row| {
-        let attributes_json: String = row.get(6)?;
-        let evidence_json: String = row.get(7)?;
+        let tags_json: String = row.get(10)?;
+        let attributes_json: String = row.get(11)?;
+        let evidence_json: String = row.get(12)?;
         Ok(AwsResource {
             uid: row.get(0)?,
-            service: row.get(1)?,
-            resource_type: row.get(2)?,
-            id: row.get(3)?,
-            arn: row.get(4)?,
-            name: row.get(5)?,
+            provider: row.get(1)?,
+            account_id: row.get(2)?,
+            partition: row.get(3)?,
+            region: row.get(4)?,
+            service: row.get(5)?,
+            resource_type: row.get(6)?,
+            id: row.get(7)?,
+            arn: row.get(8)?,
+            name: row.get(9)?,
+            tags: parse_json(tags_json)?,
             attributes: parse_json(attributes_json)?,
             evidence: parse_json(evidence_json)?,
         })
@@ -193,16 +211,18 @@ fn load_terraform_resources(
 ) -> Result<Vec<TerraformResource>> {
     let mut statement = connection.prepare(
         r#"
-        SELECT address, resource_type, aws_uid
+        SELECT address, resource_type, aws_uid, attributes_json
         FROM terraform_resource_instances
         WHERE state_id = ?1
         "#,
     )?;
     let rows = statement.query_map(params![state_id], |row| {
+        let attributes_json: String = row.get(3)?;
         Ok(TerraformResource {
             address: row.get(0)?,
             resource_type: row.get(1)?,
             aws_uid: row.get(2)?,
+            attributes: parse_json(attributes_json)?,
         })
     })?;
 
@@ -212,18 +232,17 @@ fn load_terraform_resources(
 
 fn terraform_owned_public_ingress(
     resource: &AwsResource,
-    terraform_by_uid: &BTreeMap<String, String>,
+    terraform_resource: &TerraformResource,
 ) -> Option<Finding> {
     if !is_public_security_group(resource) {
         return None;
     }
-    let terraform_address = terraform_by_uid.get(&resource.uid)?.clone();
     Some(Finding {
         id: finding_id("terraform_owned_public_ingress", &resource.uid),
         finding_type: "terraform_owned_public_ingress".to_string(),
         severity: Severity::High,
         aws_uid: Some(resource.uid.clone()),
-        terraform_address: Some(terraform_address),
+        terraform_address: Some(terraform_resource.address.clone()),
         reason: format!(
             "{} is managed by Terraform but allows public ingress.",
             resource_label(resource)
@@ -233,6 +252,79 @@ fn terraform_owned_public_ingress(
         blast_radius: Vec::new(),
         evidence: resource.evidence.clone(),
         attributes: public_ingress_attributes(resource),
+    })
+}
+
+fn costed_instance_type_drift(
+    resource: &AwsResource,
+    terraform_resource: &TerraformResource,
+) -> Option<Finding> {
+    if resource.service != "ec2"
+        || resource.resource_type != "instance"
+        || terraform_resource.resource_type != "aws_instance"
+    {
+        return None;
+    }
+    let current_instance_type = string_attr(&resource.attributes, "instance_type")?;
+    let terraform_instance_type = string_attr(&terraform_resource.attributes, "instance_type")?;
+    if current_instance_type == terraform_instance_type {
+        return None;
+    }
+
+    let current_cost = estimated_cost_for_attributes(resource, resource.attributes.clone())?;
+    let terraform_cost =
+        estimated_cost_for_attributes(resource, terraform_resource.attributes.clone())?;
+    let monthly_delta = current_cost.monthly_usd - terraform_cost.monthly_usd;
+    let hourly_delta = current_cost.hourly_usd - terraform_cost.hourly_usd;
+    let severity = if monthly_delta.abs() >= 100.0 {
+        Severity::High
+    } else {
+        Severity::Medium
+    };
+
+    Some(Finding {
+        id: finding_id("terraform_instance_type_drift", &resource.uid),
+        finding_type: "terraform_instance_type_drift".to_string(),
+        severity,
+        aws_uid: Some(resource.uid.clone()),
+        terraform_address: Some(terraform_resource.address.clone()),
+        reason: format!(
+            "{} is managed by Terraform as {} but AWS is running {} (estimated {:+.2} USD/month).",
+            resource_label(resource),
+            terraform_instance_type,
+            current_instance_type,
+            monthly_delta
+        ),
+        recommended_action: format!(
+            "Run Terraform plan/apply to return the instance to {terraform_instance_type}, or update Terraform to {current_instance_type} if the resize is intentional."
+        ),
+        blast_radius: Vec::new(),
+        evidence: resource.evidence.clone(),
+        attributes: json!({
+            "service": resource.service,
+            "type": resource.resource_type,
+            "id": resource.id,
+            "arn": resource.arn,
+            "drift": {
+                "attribute": "instance_type",
+                "terraform_value": terraform_instance_type,
+                "aws_value": current_instance_type
+            },
+            "cost": {
+                "currency": current_cost.currency,
+                "source": current_cost.source,
+                "confidence": current_cost.confidence,
+                "estimated_current_hourly_usd": round_money(current_cost.hourly_usd),
+                "estimated_current_daily_usd": round_money(current_cost.daily_usd),
+                "estimated_current_monthly_usd": round_money(current_cost.monthly_usd),
+                "estimated_terraform_hourly_usd": round_money(terraform_cost.hourly_usd),
+                "estimated_terraform_daily_usd": round_money(terraform_cost.daily_usd),
+                "estimated_terraform_monthly_usd": round_money(terraform_cost.monthly_usd),
+                "estimated_delta_hourly_usd": round_money(hourly_delta),
+                "estimated_delta_daily_usd": round_money(hourly_delta * 24.0),
+                "estimated_delta_monthly_usd": round_money(monthly_delta)
+            }
+        }),
     })
 }
 
@@ -263,6 +355,18 @@ fn unmanaged_public_resource(
 }
 
 fn unmanaged_resource(resource: &AwsResource) -> Finding {
+    let mut attributes = json!({
+        "service": resource.service,
+        "type": resource.resource_type,
+        "id": resource.id,
+        "arn": resource.arn,
+    });
+    if let Some(cost) = current_cost_attributes(resource)
+        && let Value::Object(map) = &mut attributes
+    {
+        map.insert("cost".to_string(), cost);
+    }
+
     Finding {
         id: finding_id("unmanaged_resource", &resource.uid),
         finding_type: "unmanaged_resource".to_string(),
@@ -277,12 +381,7 @@ fn unmanaged_resource(resource: &AwsResource) -> Finding {
             "Import into Terraform, add to the intended IaC stack, or delete if unused.".to_string(),
         blast_radius: Vec::new(),
         evidence: resource.evidence.clone(),
-        attributes: json!({
-            "service": resource.service,
-            "type": resource.resource_type,
-            "id": resource.id,
-            "arn": resource.arn,
-        }),
+        attributes,
     }
 }
 
@@ -349,6 +448,59 @@ fn array_contains(value: &Value, field: &str, needle: &str) -> bool {
         .and_then(Value::as_array)
         .map(|values| values.iter().any(|value| value.as_str() == Some(needle)))
         .unwrap_or(false)
+}
+
+fn estimated_cost_for_attributes(
+    resource: &AwsResource,
+    attributes: Value,
+) -> Option<crate::model::ResourceCost> {
+    let synthetic = Resource {
+        uid: resource.uid.clone(),
+        provider: resource.provider.clone(),
+        account_id: resource.account_id.clone(),
+        partition: resource.partition.clone(),
+        region: resource.region.clone(),
+        service: resource.service.clone(),
+        resource_type: resource.resource_type.clone(),
+        id: resource.id.clone(),
+        arn: resource.arn.clone(),
+        name: resource.name.clone(),
+        tags: resource.tags.clone(),
+        attributes,
+        evidence: Vec::new(),
+        raw: None,
+    };
+    estimate_resource_cost(&synthetic)
+}
+
+fn current_cost_attributes(resource: &AwsResource) -> Option<Value> {
+    let cost = estimated_cost_for_attributes(resource, resource.attributes.clone())?;
+    if cost.monthly_usd <= 0.0 {
+        return None;
+    }
+    Some(json!({
+        "currency": cost.currency,
+        "source": cost.source,
+        "confidence": cost.confidence,
+        "estimated_current_hourly_usd": round_money(cost.hourly_usd),
+        "estimated_current_daily_usd": round_money(cost.daily_usd),
+        "estimated_current_monthly_usd": round_money(cost.monthly_usd),
+        "estimated_delta_hourly_usd": round_money(cost.hourly_usd),
+        "estimated_delta_daily_usd": round_money(cost.daily_usd),
+        "estimated_delta_monthly_usd": round_money(cost.monthly_usd)
+    }))
+}
+
+fn string_attr(attributes: &Value, key: &str) -> Option<String> {
+    attributes
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn round_money(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
 }
 
 fn reverse_neighbors(connection: &Connection, scan_id: &str, uid: &str) -> Result<Vec<String>> {
@@ -511,6 +663,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compare_reports_costed_ec2_instance_type_drift() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("map.db");
+        let state_path = temp.path().join("terraform.tfstate");
+        write_inventory_db(&db_path, &sample_drift_inventory()).unwrap();
+        std::fs::write(&state_path, SAMPLE_DRIFT_TFSTATE).unwrap();
+        import_terraform_state_file(&db_path, &state_path, None).unwrap();
+
+        let report = compare_infra(&db_path, None, None).unwrap();
+
+        let drift = report
+            .findings
+            .iter()
+            .find(|finding| finding.finding_type == "terraform_instance_type_drift")
+            .unwrap();
+        assert_eq!(drift.severity, Severity::High);
+        assert_eq!(
+            drift.terraform_address.as_deref(),
+            Some("aws_instance.worker")
+        );
+        assert_eq!(
+            drift.attributes["drift"]["terraform_value"].as_str(),
+            Some("t3.small")
+        );
+        assert_eq!(
+            drift.attributes["drift"]["aws_value"].as_str(),
+            Some("t3.2xlarge")
+        );
+        assert!(
+            drift.attributes["cost"]["estimated_delta_monthly_usd"]
+                .as_f64()
+                .unwrap()
+                > 200.0
+        );
+    }
+
     fn sample_inventory() -> Inventory {
         let collected_at = Utc::now();
         let public_sg_uid = "aws:123456789012:us-east-1:ec2:security-group:sg-public".to_string();
@@ -607,6 +796,46 @@ mod tests {
         }
     }
 
+    fn sample_drift_inventory() -> Inventory {
+        let collected_at = Utc::now();
+        Inventory {
+            schema_version: SCHEMA_VERSION.to_string(),
+            generator: Generator {
+                name: "cloudmapper".to_string(),
+                version: "test".to_string(),
+            },
+            account_id: "123456789012".to_string(),
+            partition: "aws".to_string(),
+            home_region: "us-east-1".to_string(),
+            regions: vec!["us-east-1".to_string()],
+            collected_at,
+            resources: vec![Resource {
+                uid: "aws:123456789012:us-east-1:ec2:instance:i-worker".to_string(),
+                provider: "aws".to_string(),
+                account_id: "123456789012".to_string(),
+                partition: "aws".to_string(),
+                region: "us-east-1".to_string(),
+                service: "ec2".to_string(),
+                resource_type: "instance".to_string(),
+                id: "i-worker".to_string(),
+                arn: Some("arn:aws:ec2:us-east-1:123456789012:instance/i-worker".to_string()),
+                name: Some("worker".to_string()),
+                tags: BTreeMap::from([
+                    ("Environment".to_string(), "prod".to_string()),
+                    ("Application".to_string(), "drift-test".to_string()),
+                ]),
+                attributes: json!({
+                    "instance_type": "t3.2xlarge",
+                    "state": "running"
+                }),
+                evidence: Vec::new(),
+                raw: None,
+            }],
+            relationships: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
     const SAMPLE_TFSTATE: &str = r#"
 {
   "version": 4,
@@ -642,6 +871,35 @@ mod tests {
           "attributes": {
             "id": "i-missing",
             "arn": "arn:aws:ec2:us-east-1:123456789012:instance/i-missing"
+          },
+          "sensitive_attributes": [],
+          "dependencies": []
+        }
+      ]
+    }
+  ]
+}
+"#;
+
+    const SAMPLE_DRIFT_TFSTATE: &str = r#"
+{
+  "version": 4,
+  "terraform_version": "1.8.0",
+  "serial": 7,
+  "lineage": "compare-drift-test",
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "aws_instance",
+      "name": "worker",
+      "provider": "provider[\"registry.terraform.io/hashicorp/aws\"]",
+      "instances": [
+        {
+          "schema_version": 1,
+          "attributes": {
+            "id": "i-worker",
+            "arn": "arn:aws:ec2:us-east-1:123456789012:instance/i-worker",
+            "instance_type": "t3.small"
           },
           "sensitive_attributes": [],
           "dependencies": []

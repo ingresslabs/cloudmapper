@@ -186,6 +186,49 @@ pub fn write_demo_bundle(out: &Path, allow_non_empty_out: bool) -> Result<DemoSu
     })
 }
 
+pub fn write_aws_drift_demo_bundle(out: &Path, allow_non_empty_out: bool) -> Result<DemoSummary> {
+    let inventory = aws_drift_demo_inventory();
+    write_infra(out, &inventory, allow_non_empty_out)?;
+
+    let db_path = out.join("map.db");
+    let state_path = out.join("aws-drift-demo.tfstate");
+    std::fs::write(&state_path, aws_drift_demo_tfstate()).with_context(|| {
+        format!(
+            "writing AWS drift demo Terraform state {}",
+            state_path.display()
+        )
+    })?;
+
+    let terraform_summary = import_terraform_state_file(
+        &db_path,
+        &state_path,
+        Some("terraform:aws-drift-demo".to_string()),
+    )?;
+    let report = compare_infra(&db_path, None, Some(&terraform_summary.state_id))?;
+    let findings_path = out.join("findings.json");
+    std::fs::write(
+        &findings_path,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )
+    .with_context(|| {
+        format!(
+            "writing AWS drift demo findings {}",
+            findings_path.display()
+        )
+    })?;
+
+    Ok(DemoSummary {
+        out: out.to_path_buf(),
+        db_path,
+        state_path,
+        findings_path,
+        resources: inventory.resources.len(),
+        relationships: inventory.relationships.len(),
+        findings: report.findings.len(),
+        terraform_state_id: terraform_summary.state_id,
+    })
+}
+
 pub fn demo_inventory() -> Inventory {
     let mut resources = Vec::new();
     let mut relationships = Vec::new();
@@ -240,6 +283,228 @@ pub fn demo_inventory() -> Inventory {
                 message: "demo access gap for one legacy function tag read".to_string(),
             },
         ],
+    }
+}
+
+pub fn aws_drift_demo_inventory() -> Inventory {
+    let mut resources = Vec::new();
+    let mut relationships = Vec::new();
+    let region = REGIONS[0];
+    let env = ENVIRONMENTS[0];
+    let vpc_id = "vpc-driftprod".to_string();
+    let vpc_uid = resource_uid(ACCOUNT_ID, region.name, "ec2", "vpc", &vpc_id);
+    let subnet_id = "subnet-driftprod-a".to_string();
+    let subnet_uid = resource_uid(ACCOUNT_ID, region.name, "ec2", "subnet", &subnet_id);
+    let sg_id = "sg-driftprod-app".to_string();
+    let sg_uid = resource_uid(ACCOUNT_ID, region.name, "ec2", "security-group", &sg_id);
+    let app = AppProfile {
+        name: "drift-api",
+        short: "drift",
+        owner: "platform-finops",
+        port: 8443,
+        managed_prod: true,
+        managed_instances: true,
+        lambda: false,
+    };
+
+    resources.push(Resource {
+        uid: vpc_uid.clone(),
+        provider: "aws".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        partition: "aws".to_string(),
+        region: region.name.to_string(),
+        service: "ec2".to_string(),
+        resource_type: "vpc".to_string(),
+        id: vpc_id.clone(),
+        arn: Some(ec2_arn(region.name, "vpc", &vpc_id)),
+        name: Some("prod-drift-vpc".to_string()),
+        tags: tags(&[
+            ("Environment", env.name),
+            ("Application", app.name),
+            ("Owner", "network-platform"),
+            ("ManagedBy", "terraform"),
+            ("CostCenter", "cc-310-finops"),
+        ]),
+        attributes: json!({
+            "cidr_block": "10.70.0.0/16",
+            "is_default": false,
+            "dns_hostnames": true,
+            "dns_support": true
+        }),
+        evidence: vec![evidence("ec2", "DescribeVpcs", "$.Vpcs[*]")],
+        raw: None,
+    });
+
+    resources.push(Resource {
+        uid: subnet_uid.clone(),
+        provider: "aws".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        partition: "aws".to_string(),
+        region: region.name.to_string(),
+        service: "ec2".to_string(),
+        resource_type: "subnet".to_string(),
+        id: subnet_id.clone(),
+        arn: Some(ec2_arn(region.name, "subnet", &subnet_id)),
+        name: Some("prod-drift-app-a".to_string()),
+        tags: tags(&[
+            ("Environment", env.name),
+            ("Application", app.name),
+            ("Owner", "network-platform"),
+            ("ManagedBy", "terraform"),
+            ("CostCenter", "cc-310-finops"),
+        ]),
+        attributes: json!({
+            "cidr_block": "10.70.10.0/24",
+            "availability_zone": "us-east-1a",
+            "vpc_id": vpc_id
+        }),
+        evidence: vec![evidence("ec2", "DescribeSubnets", "$.Subnets[*]")],
+        raw: None,
+    });
+    relationships.push(relationship(&subnet_uid, "in_vpc", &vpc_uid));
+
+    resources.push(Resource {
+        uid: sg_uid.clone(),
+        provider: "aws".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        partition: "aws".to_string(),
+        region: region.name.to_string(),
+        service: "ec2".to_string(),
+        resource_type: "security-group".to_string(),
+        id: sg_id.clone(),
+        arn: Some(ec2_arn(region.name, "security-group", &sg_id)),
+        name: Some("prod-drift-api-sg".to_string()),
+        tags: app_tags(env, app, "terraform"),
+        attributes: json!({
+            "description": "Terraform-owned drift demo workload ingress",
+            "vpc_id": vpc_id,
+            "ingress": [{
+                "ip_protocol": "tcp",
+                "from_port": 8443,
+                "to_port": 8443,
+                "ipv4_ranges": ["10.70.0.0/16"],
+                "ipv6_ranges": []
+            }],
+            "egress": [{
+                "ip_protocol": "-1",
+                "ipv4_ranges": ["0.0.0.0/0"],
+                "ipv6_ranges": []
+            }]
+        }),
+        evidence: vec![evidence(
+            "ec2",
+            "DescribeSecurityGroups",
+            "$.SecurityGroups[*]",
+        )],
+        raw: None,
+    });
+    relationships.push(relationship(&sg_uid, "in_vpc", &vpc_uid));
+
+    let drift_instance_id = "i-driftapi01".to_string();
+    let drift_instance_uid = resource_uid(
+        ACCOUNT_ID,
+        region.name,
+        "ec2",
+        "instance",
+        &drift_instance_id,
+    );
+    resources.push(Resource {
+        uid: drift_instance_uid.clone(),
+        provider: "aws".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        partition: "aws".to_string(),
+        region: region.name.to_string(),
+        service: "ec2".to_string(),
+        resource_type: "instance".to_string(),
+        id: drift_instance_id.clone(),
+        arn: Some(ec2_arn(region.name, "instance", &drift_instance_id)),
+        name: Some("prod-drift-api-01".to_string()),
+        tags: app_tags(env, app, "terraform"),
+        attributes: json!({
+            "instance_type": "m7i.2xlarge",
+            "state": "running",
+            "private_ip_address": "10.70.10.21",
+            "subnet_id": subnet_id,
+            "vpc_id": vpc_id,
+            "iam_instance_profile": "cloudmapper-drift-api-runtime"
+        }),
+        evidence: vec![evidence("ec2", "DescribeInstances", "$.Reservations[*]")],
+        raw: Some(json!({
+            "InstanceId": drift_instance_id,
+            "InstanceType": "m7i.2xlarge"
+        })),
+    });
+    relationships.push(relationship(&drift_instance_uid, "in_subnet", &subnet_uid));
+    relationships.push(relationship(
+        &drift_instance_uid,
+        "uses_security_group",
+        &sg_uid,
+    ));
+
+    let unmanaged_instance_id = "i-costleak01".to_string();
+    let unmanaged_instance_uid = resource_uid(
+        ACCOUNT_ID,
+        region.name,
+        "ec2",
+        "instance",
+        &unmanaged_instance_id,
+    );
+    resources.push(Resource {
+        uid: unmanaged_instance_uid.clone(),
+        provider: "aws".to_string(),
+        account_id: ACCOUNT_ID.to_string(),
+        partition: "aws".to_string(),
+        region: region.name.to_string(),
+        service: "ec2".to_string(),
+        resource_type: "instance".to_string(),
+        id: unmanaged_instance_id.clone(),
+        arn: Some(ec2_arn(region.name, "instance", &unmanaged_instance_id)),
+        name: Some("prod-cost-leak-01".to_string()),
+        tags: tags(&[
+            ("Environment", env.name),
+            ("Application", "cost-lab"),
+            ("Owner", "platform-finops"),
+            ("ManagedBy", "console"),
+            ("CostCenter", "cc-310-finops"),
+        ]),
+        attributes: json!({
+            "instance_type": "m7i.2xlarge",
+            "state": "running",
+            "private_ip_address": "10.70.10.88",
+            "subnet_id": subnet_id,
+            "vpc_id": vpc_id
+        }),
+        evidence: vec![evidence("ec2", "DescribeInstances", "$.Reservations[*]")],
+        raw: Some(json!({
+            "InstanceId": unmanaged_instance_id,
+            "InstanceType": "m7i.2xlarge"
+        })),
+    });
+    relationships.push(relationship(
+        &unmanaged_instance_uid,
+        "in_subnet",
+        &subnet_uid,
+    ));
+    relationships.push(relationship(
+        &unmanaged_instance_uid,
+        "uses_security_group",
+        &sg_uid,
+    ));
+
+    Inventory {
+        schema_version: SCHEMA_VERSION.to_string(),
+        generator: Generator {
+            name: GENERATOR_NAME.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        account_id: ACCOUNT_ID.to_string(),
+        partition: "aws".to_string(),
+        home_region: HOME_REGION.to_string(),
+        regions: vec![region.name.to_string()],
+        collected_at: fixed_time(),
+        resources,
+        relationships,
+        errors: Vec::new(),
     }
 }
 
@@ -946,6 +1211,87 @@ fn demo_tfstate() -> String {
     )
 }
 
+fn aws_drift_demo_tfstate() -> String {
+    let vpc_id = "vpc-driftprod";
+    let subnet_id = "subnet-driftprod-a";
+    let sg_id = "sg-driftprod-app";
+    let instance_id = "i-driftapi01";
+    let resources = vec![
+        terraform_resource(
+            "aws_vpc",
+            "drift_prod",
+            json!({
+                "id": vpc_id,
+                "arn": ec2_arn("us-east-1", "vpc", vpc_id),
+                "cidr_block": "10.70.0.0/16",
+                "tags": {
+                    "Environment": "prod",
+                    "Application": "drift-api",
+                    "Owner": "network-platform",
+                    "ManagedBy": "terraform"
+                }
+            }),
+            json!([]),
+        ),
+        terraform_resource(
+            "aws_subnet",
+            "drift_prod_app_a",
+            json!({
+                "id": subnet_id,
+                "arn": ec2_arn("us-east-1", "subnet", subnet_id),
+                "availability_zone": "us-east-1a",
+                "cidr_block": "10.70.10.0/24",
+                "vpc_id": vpc_id
+            }),
+            json!(["aws_vpc.drift_prod"]),
+        ),
+        terraform_resource(
+            "aws_security_group",
+            "drift_prod_app",
+            json!({
+                "id": sg_id,
+                "arn": ec2_arn("us-east-1", "security-group", sg_id),
+                "name": "prod-drift-api-sg",
+                "vpc_id": vpc_id
+            }),
+            json!(["aws_vpc.drift_prod"]),
+        ),
+        terraform_resource(
+            "aws_instance",
+            "drift_api",
+            json!({
+                "id": instance_id,
+                "arn": ec2_arn("us-east-1", "instance", instance_id),
+                "instance_type": "m7i.large",
+                "subnet_id": subnet_id,
+                "vpc_security_group_ids": [sg_id],
+                "tags": {
+                    "Environment": "prod",
+                    "Application": "drift-api",
+                    "Owner": "platform-finops",
+                    "ManagedBy": "terraform"
+                }
+            }),
+            json!([
+                "aws_subnet.drift_prod_app_a",
+                "aws_security_group.drift_prod_app"
+            ]),
+        ),
+    ];
+
+    let state = json!({
+        "version": 4,
+        "terraform_version": "1.8.0",
+        "serial": 7,
+        "lineage": "cloudmapper-aws-drift-demo",
+        "resources": resources
+    });
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&state).expect("AWS drift demo state is serializable")
+    )
+}
+
 fn terraform_resource(
     resource_type: &str,
     name: &str,
@@ -1094,6 +1440,7 @@ fn cost_center(app: AppProfile) -> &'static str {
         "ord" => "cc-130-commerce",
         "edge" => "cc-140-edge",
         "ana" => "cc-210-data",
+        "drift" => "cc-310-finops",
         _ => "cc-900-corp-it",
     }
 }
@@ -1170,5 +1517,54 @@ mod tests {
         assert_eq!(critical_count, 15);
         assert_eq!(high_count, 3);
         assert_eq!(terraform_count, 100);
+    }
+
+    #[test]
+    fn writes_aws_drift_demo_bundle_with_costed_findings() {
+        let temp = tempdir().unwrap();
+        let summary = write_aws_drift_demo_bundle(temp.path(), false).unwrap();
+
+        assert!(summary.db_path.exists());
+        assert!(summary.state_path.exists());
+        assert!(summary.findings_path.exists());
+        assert_eq!(summary.resources, 5);
+        assert_eq!(summary.relationships, 6);
+        assert_eq!(summary.findings, 2);
+        assert_eq!(summary.terraform_state_id, "terraform:aws-drift-demo");
+
+        let connection = Connection::open(summary.db_path).unwrap();
+        let terraform_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM terraform_resource_instances",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let drift_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM findings WHERE finding_type = 'terraform_instance_type_drift'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unmanaged_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM findings WHERE finding_type = 'unmanaged_resource'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let drift_cost_delta: f64 = connection
+            .query_row(
+                "SELECT json_extract(attributes_json, '$.cost.estimated_delta_monthly_usd') FROM findings WHERE finding_type = 'terraform_instance_type_drift'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(terraform_count, 4);
+        assert_eq!(drift_count, 1);
+        assert_eq!(unmanaged_count, 1);
+        assert!(drift_cost_delta > 200.0);
     }
 }
