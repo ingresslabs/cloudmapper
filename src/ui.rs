@@ -1263,6 +1263,8 @@ mod tests {
         assert!(APP_CSS.contains(".drift-view"));
         assert!(APP_CSS.contains(".remediation-view"));
         assert!(APP_CSS.contains(".mission-terminal"));
+        assert!(APP_CSS.contains(".blast-lens"));
+        assert!(APP_CSS.contains(".attack-story-card"));
         assert!(APP_CSS.contains(".workspace.hide-inspector"));
         assert!(APP_CSS.contains(".workspace.hide-findings"));
         assert!(APP_JS.contains("function spreadGraph()"));
@@ -1270,6 +1272,9 @@ mod tests {
         assert!(APP_JS.contains("function renderCostAnalytics()"));
         assert!(APP_JS.contains("function renderDriftView()"));
         assert!(APP_JS.contains("function renderRemediationView()"));
+        assert!(APP_JS.contains("Attack Storyboard"));
+        assert!(APP_JS.contains("function k8sAttackStory"));
+        assert!(APP_JS.contains("function derivedBlastIdsForFinding"));
         assert!(APP_JS.contains("COST_BASIS"));
         assert!(APP_JS.contains("function renderMissionTerminal()"));
         assert!(APP_JS.contains("function updateMissionTerminalTheme()"));

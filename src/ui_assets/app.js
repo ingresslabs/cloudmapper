@@ -20,6 +20,7 @@ const state = {
   blastNodeIds: null,
   atlasSelection: null,
   attackSelection: null,
+  attackStoryKey: null,
   collapsedGroups: new Set(),
   palette: {
     open: false,
@@ -1498,6 +1499,7 @@ function compareFindings(left, right) {
 function selectExposureCell(cell) {
   state.atlasSelection = cell.key;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   state.selectedFinding = null;
   state.selectedNodeId = null;
   state.selection = { type: "exposure", data: cell };
@@ -1545,316 +1547,494 @@ function showExposureSelection(cell) {
 function renderAttackPaths() {
   const container = $("#d3-view");
   const paths = buildAttackPathData();
-  if (!paths.findings.length) {
-    container.innerHTML = emptyState("No public attack paths", "Current filters hide public ingress findings.");
+  if (!paths.stories.length) {
+    container.innerHTML = emptyState("No public attack paths", "Current filters hide public ingress or public service findings.");
     return;
   }
+  const selected = selectedAttackStory(paths);
 
   container.innerHTML = `
-    <div class="d3-layer attack-paths">
+    <div class="d3-layer attack-paths attack-storyboard-view">
       <div class="d3-view-header">
-        <span class="d3-view-title">Attack Paths</span>
+        <span class="d3-view-title">Attack Storyboard</span>
         <div class="d3-view-stats">
-          <span><strong>${paths.findings.length}</strong> public findings</span>
+          <span><strong>${paths.stories.length}</strong> stories</span>
           <span><strong>${paths.routes}</strong> public routes</span>
           <span><strong>${paths.targets}</strong> exposed targets</span>
-          <span><strong>${paths.downstream}</strong> downstream</span>
+          <span><strong>${paths.downstream}</strong> blast objects</span>
         </div>
         <div class="atlas-legend">
           <span><span class="severity-dot critical"></span>critical</span>
           <span><span class="severity-dot high"></span>high</span>
-          <span><span class="severity-dot managed"></span>tag-linked data</span>
+          <span><span class="severity-dot medium"></span>medium</span>
         </div>
       </div>
-      <div id="attack-stage" class="d3-stage attack-stage"></div>
+      <div class="attack-storyboard">
+        ${blastLensHtml(selected)}
+        <section class="attack-story-list" aria-label="Attack stories">
+          ${paths.stories.map((story, index) => attackStoryCardHtml(story, index, selected.key)).join("")}
+        </section>
+      </div>
     </div>
   `;
 
-  const stage = $("#attack-stage");
-  const bounds = stage.getBoundingClientRect();
-  const width = Math.max(740, Math.floor(bounds.width || 740));
-  const margin = { top: 52, right: 28, bottom: 28, left: 24 };
-  const nodeWidth = Math.max(112, Math.min(154, Math.floor((width - margin.left - margin.right) / paths.layers.length) - 22));
-  const nodeHeight = 43;
-  const rowGap = 56;
-  const maxLayerSize = Math.max(...paths.layers.map((layer) => layer.nodes.length));
-  const height = Math.max(Math.floor(bounds.height || 440), margin.top + margin.bottom + maxLayerSize * rowGap + 38);
-  const x = d3.scalePoint()
-    .domain(paths.layers.map((layer) => layer.id))
-    .range([margin.left, width - margin.right - nodeWidth])
-    .padding(0.42);
-  const linkWidth = d3.scaleSqrt()
-    .domain([1, Math.max(1, d3.max(paths.links, (link) => link.count) || 1)])
-    .range([1.2, 7]);
-
-  for (const layer of paths.layers) {
-    const startY = margin.top + 36;
-    layer.nodes.forEach((node, index) => {
-      node.x = x(layer.id);
-      node.y = startY + index * rowGap;
-      node.width = nodeWidth;
-      node.height = nodeHeight;
+  container.querySelectorAll("[data-attack-story]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const story = paths.stories.find((candidate) => candidate.key === button.dataset.attackStory);
+      if (story) selectAttackStory(story);
     });
-  }
-
-  const nodeMap = new Map(paths.nodes.map((node) => [node.id, node]));
-  const svg = d3.select(stage)
-    .append("svg")
-    .attr("class", "d3-svg attack-svg")
-    .attr("viewBox", `0 0 ${width} ${height}`)
-    .style("height", `${height}px`)
-    .attr("role", "img")
-    .attr("aria-label", "Attack path view");
-
-  const defs = svg.append("defs");
-  defs.append("marker")
-    .attr("id", "attack-arrow")
-    .attr("viewBox", "0 0 10 10")
-    .attr("refX", 9)
-    .attr("refY", 5)
-    .attr("markerWidth", 5)
-    .attr("markerHeight", 5)
-    .attr("orient", "auto-start-reverse")
-    .append("path")
-    .attr("d", "M 0 0 L 10 5 L 0 10 z")
-    .attr("fill", cssVar("--muted", "#8f8f99"));
-
-  svg.append("g")
-    .selectAll("text")
-    .data(paths.layers)
-    .join("text")
-    .attr("class", "attack-column-label")
-    .attr("x", (layer) => x(layer.id) + nodeWidth / 2)
-    .attr("y", 25)
-    .attr("text-anchor", "middle")
-    .text((layer) => layer.label);
-
-  const link = svg.append("g")
-    .attr("class", "attack-links")
-    .selectAll("path")
-    .data(paths.links)
-    .join("path")
-    .attr("class", (item) => `attack-link${item.inferred ? " inferred" : ""}`)
-    .attr("d", (item) => attackLinkPath(nodeMap.get(item.source), nodeMap.get(item.target)))
-    .attr("stroke", (item) => severityColor(item.severity))
-    .attr("stroke-width", (item) => linkWidth(item.count))
-    .attr("marker-end", "url(#attack-arrow)");
-
-  link.append("title")
-    .text((item) => `${item.label || "path"}: ${item.count}`);
-
-  svg.append("g")
-    .attr("class", "attack-link-labels")
-    .selectAll("text")
-    .data(paths.links.filter((item) => item.count > 1))
-    .join("text")
-    .attr("class", "attack-link-label")
-    .attr("x", (item) => {
-      const source = nodeMap.get(item.source);
-      const target = nodeMap.get(item.target);
-      return (source.x + source.width + target.x) / 2;
-    })
-    .attr("y", (item) => {
-      const source = nodeMap.get(item.source);
-      const target = nodeMap.get(item.target);
-      return (source.y + target.y) / 2 + 2;
-    })
-    .text((item) => item.count);
-
-  const nodes = svg.append("g")
-    .selectAll("g")
-    .data(paths.nodes)
-    .join("g")
-    .attr("class", (node) => {
-      const classes = ["attack-node", `attack-${node.kind}`];
-      if (state.attackSelection === node.id) classes.push("selected");
-      return classes.join(" ");
-    })
-    .attr("transform", (node) => `translate(${node.x},${node.y})`)
-    .on("click", (_event, node) => selectAttackNode(node));
-
-  nodes.append("title")
-    .text((node) => attackNodeTitle(node));
-
-  nodes.append("rect")
-    .attr("class", "attack-node-bg")
-    .attr("width", nodeWidth)
-    .attr("height", nodeHeight)
-    .attr("rx", 7)
-    .attr("fill", (node) => attackNodeFill(node))
-    .attr("stroke", (node) => severityColor(node.severity));
-
-  nodes.append("text")
-    .attr("class", "attack-node-title")
-    .attr("x", 10)
-    .attr("y", 17)
-    .text((node) => shortText(node.label, Math.max(11, Math.floor(nodeWidth / 8))));
-
-  nodes.append("text")
-    .attr("class", "attack-node-meta")
-    .attr("x", 10)
-    .attr("y", 33)
-    .text((node) => shortText(attackNodeMeta(node), Math.max(12, Math.floor(nodeWidth / 7))));
-
-  nodes.append("text")
-    .attr("class", "attack-node-count")
-    .attr("x", nodeWidth - 9)
-    .attr("y", 17)
-    .attr("text-anchor", "end")
-    .text((node) => node.count > 1 ? node.count : "");
+  });
+  container.querySelector("[data-attack-focus]")?.addEventListener("click", () => {
+    selectAttackStory(selected, { render: false });
+    setFocusMode("blast");
+    setViewMode("graph");
+  });
 }
 
 function buildAttackPathData() {
   const nodeIndex = new Map(graphNodeData().map((node) => [node.id, node]));
   const visibleNodes = graphNodeData().filter(dataMatchesFilters);
   const visibleIds = new Set(visibleNodes.map((node) => node.id));
-  const attackNodes = new Map();
-  const attackLinks = new Map();
-  const routeKeys = new Set();
   const targetIds = new Set();
   const downstreamIds = new Set();
-  const pathFindings = [];
+  const routeKeys = new Set();
 
-  const internet = ensureAttackNode(attackNodes, {
-    id: "external:internet",
-    kind: "external",
-    layer: "external",
-    label: "Internet",
-    detail: "public ingress",
-    severity: "high",
-  });
+  const stories = state.findings
+    .filter((finding) => finding.aws_uid && visibleIds.has(finding.aws_uid) && isAttackPathFinding(finding))
+    .map((finding) => attackStoryFromFinding(finding, nodeIndex))
+    .filter(Boolean)
+    .sort(compareAttackStories);
 
-  const findings = state.findings.filter((finding) => {
-    return finding.aws_uid && visibleIds.has(finding.aws_uid) && publicIngressRules(finding).length;
-  }).sort(compareFindings);
-
-  for (const finding of findings) {
-    const securityGroup = nodeIndex.get(finding.aws_uid);
-    if (!securityGroup) continue;
-    pathFindings.push(finding);
-    const sgNode = ensureAttackNode(attackNodes, {
-      id: `security:${finding.aws_uid}`,
-      kind: "security",
-      layer: "security",
-      label: securityGroup.label || securityGroup.name || securityGroup.id,
-      detail: `${securityGroup.region || ""} ${securityGroup.application || ""}`.trim(),
-      severity: finding.severity,
-      resourceIds: [finding.aws_uid],
-      findings: [finding],
-      application: securityGroup.application || null,
-      environment: securityGroup.environment || null,
-      owner: securityGroup.owner || null,
-    });
-    sgNode.publicIngress += publicIngressRules(finding).length;
-
-    for (const rule of publicIngressRules(finding)) {
-      const portLabel = publicPortLabel(rule);
-      const portNode = ensureAttackNode(attackNodes, {
-        id: `port:${portLabel}`,
-        kind: "port",
-        layer: "ingress",
-        label: portLabel,
-        detail: "public listener",
-        severity: finding.severity,
-        findings: [finding],
-      });
-
-      for (const source of publicSourceLabels(rule)) {
-        const routeKey = `${finding.id}:${source}:${portLabel}`;
-        routeKeys.add(routeKey);
-        internet.count += 1;
-
-        const sourceNode = ensureAttackNode(attackNodes, {
-          id: `source:${source}`,
-          kind: "source",
-          layer: "source",
-          label: source,
-          detail: source === "::/0" ? "IPv6 public" : "IPv4 public",
-          severity: finding.severity,
-          findings: [finding],
-        });
-        sourceNode.count += 1;
-        portNode.count += 1;
-        sgNode.count += 1;
-        addAttackLink(attackLinks, internet.id, sourceNode.id, { count: 1, severity: finding.severity, label: "public source" });
-        addAttackLink(attackLinks, sourceNode.id, portNode.id, { count: 1, severity: finding.severity, label: portLabel });
-        addAttackLink(attackLinks, portNode.id, sgNode.id, { count: 1, severity: finding.severity, label: finding.finding_type });
-      }
-    }
-
-    const blastGroups = attackBlastGroups(finding, nodeIndex);
-    for (const group of blastGroups) {
-      for (const uid of group.resourceIds) targetIds.add(uid);
-      const workloadNode = ensureAttackNode(attackNodes, {
-        id: group.id,
-        kind: "workload",
-        layer: "workload",
-        label: group.label,
-        detail: group.detail,
-        severity: finding.severity,
-        resourceIds: group.resourceIds,
-        findings: [finding],
-        application: group.application,
-        environment: group.environment,
-        owner: group.owner,
-      });
-      workloadNode.count = Math.max(workloadNode.count, group.resourceIds.length);
-      addAttackLink(attackLinks, sgNode.id, workloadNode.id, {
-        count: Math.max(1, group.resourceIds.length),
-        severity: finding.severity,
-        label: "blast radius",
-      });
-
-      const downstream = attackDownstreamResources(finding, group, nodeIndex);
-      for (const downstreamGroup of downstream) {
-        downstreamGroup.resourceIds.forEach((uid) => downstreamIds.add(uid));
-        const downstreamNode = ensureAttackNode(attackNodes, {
-          id: downstreamGroup.id,
-          kind: downstreamGroup.kind,
-          layer: "downstream",
-          label: downstreamGroup.label,
-          detail: downstreamGroup.detail,
-          severity: finding.severity,
-          resourceIds: downstreamGroup.resourceIds,
-          findings: [finding],
-          application: downstreamGroup.application || group.application,
-          environment: downstreamGroup.environment || group.environment,
-          owner: downstreamGroup.owner || group.owner,
-        });
-        downstreamNode.count = Math.max(downstreamNode.count, downstreamGroup.resourceIds.length);
-        addAttackLink(attackLinks, workloadNode.id, downstreamNode.id, {
-          count: Math.max(1, downstreamGroup.resourceIds.length),
-          severity: finding.severity,
-          label: downstreamGroup.relation,
-          inferred: downstreamGroup.inferred,
-        });
-      }
-    }
+  for (const story of stories) {
+    for (const key of story.routeKeys) routeKeys.add(key);
+    for (const uid of story.targetIds) targetIds.add(uid);
+    for (const uid of story.downstreamIds) downstreamIds.add(uid);
   }
 
-  const layers = [
-    { id: "external", label: "Entry" },
-    { id: "source", label: "Source" },
-    { id: "ingress", label: "Ingress" },
-    { id: "security", label: "Security group" },
-    { id: "workload", label: "Targets" },
-    { id: "downstream", label: "Reach" },
-  ].map((layer) => ({
-    ...layer,
-    nodes: [...attackNodes.values()]
-      .filter((node) => node.layer === layer.id)
-      .sort(compareAttackNodes),
-  }));
-
   return {
-    nodes: layers.flatMap((layer) => layer.nodes),
-    links: [...attackLinks.values()].sort((left, right) => severityRank(right.severity) - severityRank(left.severity) || right.count - left.count),
-    layers,
-    findings: pathFindings,
+    stories,
+    findings: stories.map((story) => story.finding),
     routes: routeKeys.size,
     targets: targetIds.size,
     downstream: downstreamIds.size,
   };
+}
+
+function selectedAttackStory(paths) {
+  return paths.stories.find((story) => story.key === state.attackStoryKey)
+    || paths.stories.find((story) => story.finding.id === state.selectedFinding?.id)
+    || paths.stories[0];
+}
+
+function isAttackPathFinding(finding) {
+  const type = finding.finding_type || "";
+  return type === "public_ingress"
+    || type === "public_service"
+    || type === "unmanaged_public_resource"
+    || type === "terraform_owned_public_ingress"
+    || Array.isArray(finding.attributes?.public_ingress);
+}
+
+function attackStoryFromFinding(finding, nodeIndex) {
+  const entry = nodeIndex.get(finding.aws_uid);
+  if (!entry) return null;
+  if (entry.provider === "k8s" || ["public_ingress", "public_service"].includes(finding.finding_type)) {
+    return k8sAttackStory(finding, entry, nodeIndex);
+  }
+  return awsAttackStory(finding, entry, nodeIndex);
+}
+
+function k8sAttackStory(finding, entry, nodeIndex) {
+  const routeSpecs = k8sRouteSpecs(finding, entry, nodeIndex);
+  const serviceIds = k8sStoryServiceIds(entry, routeSpecs, nodeIndex);
+  const podIds = uniqueIds([
+    ...serviceIds.flatMap((uid) => edgeTargets(uid, ["selects"])),
+    ...(finding.blast_radius || []),
+  ]).filter((uid) => nodeIndex.has(uid));
+  const workloadIds = uniqueIds([...serviceIds, ...podIds]);
+  const serviceAccountIds = uniqueIds(podIds.flatMap((uid) => edgeTargets(uid, ["uses_service_account"])));
+  const roleBindingIds = uniqueIds(serviceAccountIds.flatMap((uid) => edgeSources(uid, ["grants_to"])));
+  const roleIds = uniqueIds(roleBindingIds.flatMap((uid) => edgeTargets(uid, ["grants_role"])));
+  const identityIds = uniqueIds([...serviceAccountIds, ...roleBindingIds, ...roleIds]);
+  const mountedIds = uniqueIds(podIds.flatMap((uid) => edgeTargets(uid, ["mounts", "mounts_persistent_volume_claim"])));
+  const boundVolumeIds = uniqueIds(mountedIds.flatMap((uid) => edgeTargets(uid, ["binds"])));
+  const dataIds = uniqueIds([...mountedIds, ...boundVolumeIds]).filter((uid) => nodeIndex.has(uid));
+  const allIds = uniqueIds([entry.id, ...workloadIds, ...identityIds, ...dataIds]);
+  const relatedFindings = findingsForResourceIds(allIds);
+  const title = `${entry.namespace || "cluster"} / ${entry.label || entry.name || "public route"}`;
+  const subtitle = attackFindingSubtitle(finding, "Kubernetes public exposure");
+  const routeKeys = routeSpecs.map((route) => `${finding.id}:${route.host || "public"}:${route.path || route.port || route.backendService || "route"}`);
+
+  return finalizeAttackStory({
+    key: `story:${finding.id}`,
+    provider: "k8s",
+    finding,
+    entry,
+    title,
+    subtitle,
+    routeKeys,
+    targetIds: podIds,
+    downstreamIds: uniqueIds([...identityIds, ...dataIds]),
+    resourceIds: allIds,
+    relatedFindings,
+    stages: [
+      attackStage("entry", "Entry", routeSpecs.length ? routeSpecs.map((route, index) => virtualAttackItem(`entry:${finding.id}:${index}`, route.host || route.source || "public", route.host ? "public host" : "cluster edge", "source", finding.severity)) : [virtualAttackItem(`entry:${finding.id}`, "Internet", "public source", "source", finding.severity)]),
+      attackStage("route", "Route", routeSpecs.length ? routeSpecs.map((route, index) => virtualAttackItem(`route:${finding.id}:${index}`, route.path || route.port || route.backendService || "route", route.backendService || route.detail || "public route", "route", finding.severity)) : [virtualAttackItem(`route:${finding.id}`, publicPortLabel(finding.attributes || {}), finding.finding_type, "route", finding.severity)]),
+      attackStage("edge", entry.resourceType === "service" ? "Service" : "Ingress", [nodeAttackItem(entry, "edge", [finding])]),
+      attackStage("workload", "Workload", compactNodeItems(workloadIds, nodeIndex, "workload", relatedFindings)),
+      attackStage("identity", "Identity", compactNodeItems(identityIds, nodeIndex, "identity", relatedFindings)),
+      attackStage("data", "Secrets/Data", compactNodeItems(dataIds, nodeIndex, "data", relatedFindings)),
+    ],
+  });
+}
+
+function awsAttackStory(finding, entry, nodeIndex) {
+  const rules = publicIngressRules(finding);
+  const routeKeys = [];
+  const sourceItems = [];
+  const portItems = [];
+  for (const [index, rule] of rules.entries()) {
+    const port = publicPortLabel(rule);
+    portItems.push(virtualAttackItem(`port:${finding.id}:${index}`, port, "public listener", "route", finding.severity));
+    for (const source of publicSourceLabels(rule)) {
+      routeKeys.push(`${finding.id}:${source}:${port}`);
+      sourceItems.push(virtualAttackItem(`source:${finding.id}:${index}:${source}`, source, source === "::/0" ? "IPv6 public" : "IPv4 public", "source", finding.severity));
+    }
+  }
+  const blastGroups = attackBlastGroups(finding, nodeIndex);
+  const targetIds = uniqueIds(blastGroups.flatMap((group) => group.resourceIds));
+  const downstreamIds = uniqueIds(blastGroups.flatMap((group) => attackDownstreamResources(finding, group, nodeIndex).flatMap((downstream) => downstream.resourceIds)));
+  const allIds = uniqueIds([entry.id, ...targetIds, ...downstreamIds]);
+  const relatedFindings = findingsForResourceIds(allIds);
+
+  return finalizeAttackStory({
+    key: `story:${finding.id}`,
+    provider: entry.provider || "aws",
+    finding,
+    entry,
+    title: entry.label || entry.name || entry.id,
+    subtitle: attackFindingSubtitle(finding, "Public cloud exposure"),
+    routeKeys,
+    targetIds,
+    downstreamIds,
+    resourceIds: allIds,
+    relatedFindings,
+    stages: [
+      attackStage("entry", "Entry", dedupeAttackItems(sourceItems).slice(0, 6)),
+      attackStage("route", "Route", dedupeAttackItems(portItems).slice(0, 6)),
+      attackStage("edge", "Control", [nodeAttackItem(entry, "security", [finding])]),
+      attackStage("workload", "Workload", compactNodeItems(targetIds, nodeIndex, "workload", relatedFindings)),
+      attackStage("identity", "Identity", []),
+      attackStage("data", "Data", compactNodeItems(downstreamIds, nodeIndex, "data", relatedFindings)),
+    ],
+  });
+}
+
+function finalizeAttackStory(story) {
+  const stageIds = story.stages.flatMap((stage) => stage.items.flatMap((item) => item.resourceIds || []));
+  story.resourceIds = uniqueIds([...(story.resourceIds || []), ...stageIds]);
+  story.targetIds = uniqueIds(story.targetIds || []);
+  story.downstreamIds = uniqueIds(story.downstreamIds || []);
+  story.routeKeys = uniqueIds(story.routeKeys || []);
+  story.relatedFindings = dedupeFindings([story.finding, ...(story.relatedFindings || [])]).sort(compareFindings);
+  story.maxSeverity = story.relatedFindings.reduce((severity, item) => maxSeverityName(severity, item.severity || "none"), story.finding.severity || "none");
+  story.score = severityRank(story.maxSeverity) * 1000
+    + story.routeKeys.length * 24
+    + story.targetIds.length * 8
+    + story.downstreamIds.length * 3
+    + story.relatedFindings.length * 12;
+  return story;
+}
+
+function attackStage(id, label, items) {
+  return { id, label, items: items.filter(Boolean) };
+}
+
+function nodeAttackItem(node, kind, findings = []) {
+  return {
+    id: node.id,
+    label: node.label || node.name || node.id,
+    detail: attackNodeDetail(node),
+    kind,
+    severity: node.severity || findings.reduce((severity, finding) => maxSeverityName(severity, finding.severity || "none"), "none"),
+    resourceIds: [node.id],
+    findings,
+  };
+}
+
+function virtualAttackItem(id, label, detail, kind, severity) {
+  return {
+    id,
+    label: label || "n/a",
+    detail: detail || "",
+    kind,
+    severity: severity || "none",
+    resourceIds: [],
+    findings: [],
+  };
+}
+
+function compactNodeItems(ids, nodeIndex, kind, relatedFindings = []) {
+  const nodes = uniqueIds(ids).map((uid) => nodeIndex.get(uid)).filter(Boolean);
+  const groups = new Map();
+  for (const node of nodes) {
+    const key = [node.provider, node.service, node.resourceType, node.namespace || node.region || "global"].join(":");
+    if (!groups.has(key)) {
+      groups.set(key, {
+        node,
+        ids: [],
+        labels: [],
+        findings: [],
+        severity: "none",
+      });
+    }
+    const group = groups.get(key);
+    group.ids.push(node.id);
+    group.labels.push(node.label || node.name || node.id);
+    const nodeFindings = relatedFindings.filter((finding) => findingRelatedNodeIds(finding).includes(node.id));
+    group.findings.push(...nodeFindings);
+    group.severity = maxSeverityName(group.severity, node.severity || "none");
+    for (const finding of nodeFindings) group.severity = maxSeverityName(group.severity, finding.severity || "none");
+  }
+  return [...groups.values()]
+    .sort((left, right) => severityRank(right.severity) - severityRank(left.severity) || right.ids.length - left.ids.length)
+    .map((group) => {
+      const label = group.ids.length === 1
+        ? group.labels[0]
+        : `${group.ids.length} ${group.node.resourceType || group.node.service || "resources"}`;
+      return {
+        id: `${kind}:${group.ids.join("|")}`,
+        label,
+        detail: attackNodeDetail(group.node),
+        kind,
+        severity: group.severity,
+        resourceIds: group.ids,
+        findings: dedupeFindings(group.findings),
+      };
+    });
+}
+
+function k8sRouteSpecs(finding, entry, nodeIndex) {
+  if (finding.finding_type === "public_service" || entry.resourceType === "service") {
+    const ports = Array.isArray(finding.attributes?.ports) ? finding.attributes.ports : [];
+    return ports.length
+      ? ports.map((port) => ({
+          source: finding.attributes?.type || "public service",
+          port: servicePortLabel(port),
+          backendService: entry.label || entry.name || entry.id,
+          detail: finding.attributes?.type || "Service",
+        }))
+      : [{ source: "public service", port: "service", backendService: entry.label || entry.name || entry.id, detail: "Service" }];
+  }
+
+  const routes = [];
+  const rules = Array.isArray(finding.attributes?.rules) ? finding.attributes.rules : [];
+  for (const rule of rules) {
+    const host = rule.host || "public";
+    const paths = rule.http?.paths || [];
+    if (!paths.length) {
+      routes.push({ host, path: "/", backendService: "", detail: "Ingress" });
+      continue;
+    }
+    for (const path of paths) {
+      const backendService = path.backend?.service?.name || path.backend?.serviceName || "";
+      const port = path.backend?.service?.port?.number || path.backend?.service?.port?.name || path.backend?.servicePort || "";
+      routes.push({
+        host,
+        path: path.path || "/",
+        backendService,
+        port: port ? String(port) : "",
+        detail: [backendService, port].filter(Boolean).join(":"),
+      });
+    }
+  }
+
+  if (!routes.length) {
+    for (const serviceId of edgeTargets(entry.id, ["routes_to"])) {
+      const service = nodeIndex.get(serviceId);
+      routes.push({
+        host: entry.label || entry.name || "public",
+        path: "/",
+        backendService: service?.label || service?.name || serviceId,
+        detail: "routes_to",
+      });
+    }
+  }
+  return routes;
+}
+
+function k8sStoryServiceIds(entry, routeSpecs, nodeIndex) {
+  if (entry.resourceType === "service") return [entry.id];
+  const ids = new Set(edgeTargets(entry.id, ["routes_to"]));
+  for (const route of routeSpecs) {
+    if (!route.backendService) continue;
+    const service = findK8sNode("service", entry.namespace, route.backendService, nodeIndex);
+    if (service) ids.add(service.id);
+  }
+  return [...ids];
+}
+
+function findK8sNode(resourceType, namespace, name, nodeIndex) {
+  for (const node of nodeIndex.values()) {
+    if (node.provider !== "k8s" || node.resourceType !== resourceType) continue;
+    if (namespace && node.namespace !== namespace) continue;
+    if (node.name === name || node.label === name || node.id.endsWith(`/${name}`)) return node;
+  }
+  return null;
+}
+
+function edgeTargets(uid, types = null) {
+  return (state.graph?.edges || [])
+    .map((edge) => edge.data)
+    .filter((edge) => edge.source === uid && (!types || types.includes(edge.relationshipType)))
+    .map((edge) => edge.target);
+}
+
+function edgeSources(uid, types = null) {
+  return (state.graph?.edges || [])
+    .map((edge) => edge.data)
+    .filter((edge) => edge.target === uid && (!types || types.includes(edge.relationshipType)))
+    .map((edge) => edge.source);
+}
+
+function findingsForResourceIds(ids) {
+  const idSet = new Set(ids);
+  return state.findings.filter((finding) => findingRelatedNodeIds(finding).some((uid) => idSet.has(uid)));
+}
+
+function dedupeFindings(findings) {
+  const seen = new Set();
+  const result = [];
+  for (const finding of findings.filter(Boolean)) {
+    if (seen.has(finding.id)) continue;
+    seen.add(finding.id);
+    result.push(finding);
+  }
+  return result;
+}
+
+function uniqueIds(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function dedupeAttackItems(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const key = `${item.kind}:${item.label}:${item.detail}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function compareAttackStories(left, right) {
+  return right.score - left.score
+    || severityRank(right.maxSeverity) - severityRank(left.maxSeverity)
+    || right.targetIds.length - left.targetIds.length
+    || left.title.localeCompare(right.title);
+}
+
+function attackNodeDetail(node) {
+  return [node.namespace, node.region, node.application, node.environment, node.resourceType]
+    .filter(Boolean)
+    .join(" / ");
+}
+
+function servicePortLabel(port) {
+  const protocol = port.protocol || "TCP";
+  const servicePort = port.port ?? port.name ?? "";
+  const target = port.targetPort ?? port.nodePort ?? "";
+  return target && target !== servicePort
+    ? `${protocol}/${servicePort}->${target}`
+    : `${protocol}/${servicePort || "port"}`;
+}
+
+function attackFindingSubtitle(finding, fallback) {
+  const reason = String(finding.reason || fallback || "");
+  return reason
+    .replace(/^(Ingress|Service|Deployment|Pod|Role|ClusterRole|RoleBinding|ClusterRoleBinding)\s+\S+\s+/, "")
+    .trim() || fallback;
+}
+
+function blastLensHtml(story) {
+  const topFindings = story.relatedFindings.slice(0, 5);
+  return `
+    <section class="blast-lens severity-${escapeHtml(story.maxSeverity)}" aria-label="Blast lens">
+      <div class="blast-lens-head">
+        <span class="severity-dot ${escapeHtml(story.maxSeverity)}"></span>
+        <div>
+          <strong>${escapeHtml(story.title)}</strong>
+          <small>${escapeHtml(story.subtitle)}</small>
+        </div>
+        <button type="button" data-attack-focus title="Focus graph on blast radius" aria-label="Focus graph on blast radius">${iconSvg("icon-blast")}</button>
+      </div>
+      <div class="blast-lens-metrics">
+        ${attackMetric("routes", story.routeKeys.length)}
+        ${attackMetric("targets", story.targetIds.length)}
+        ${attackMetric("blast", story.downstreamIds.length)}
+        ${attackMetric("findings", story.relatedFindings.length)}
+      </div>
+      <div class="blast-flow">
+        ${story.stages.map((stage) => blastStageHtml(stage)).join("")}
+      </div>
+      <div class="blast-findings">
+        ${topFindings.map((finding) => `
+          <span class="blast-finding severity-${escapeHtml(finding.severity)}">
+            <span class="severity-dot ${escapeHtml(finding.severity)}"></span>${escapeHtml(finding.finding_type)}
+          </span>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function attackMetric(label, value) {
+  return `<span><strong>${escapeHtml(String(value))}</strong>${escapeHtml(label)}</span>`;
+}
+
+function blastStageHtml(stage) {
+  const shown = stage.items.slice(0, 4);
+  return `
+    <div class="blast-stage">
+      <span>${escapeHtml(stage.label)}</span>
+      <div>
+        ${shown.map((item) => `<b class="severity-${escapeHtml(item.severity)}">${escapeHtml(shortText(item.label, 34))}</b>`).join("")}
+        ${stage.items.length > shown.length ? `<b>+${stage.items.length - shown.length}</b>` : ""}
+        ${stage.items.length ? "" : "<b>none</b>"}
+      </div>
+    </div>
+  `;
+}
+
+function attackStoryCardHtml(story, index, activeKey) {
+  const active = story.key === activeKey;
+  return `
+    <button type="button" class="attack-story-card severity-${escapeHtml(story.maxSeverity)}${active ? " selected" : ""}" data-attack-story="${escapeHtml(story.key)}">
+      <span class="attack-story-rank">${index + 1}</span>
+      <span class="severity-dot ${escapeHtml(story.maxSeverity)}"></span>
+      <span class="attack-story-main">
+        <strong>${escapeHtml(story.title)}</strong>
+        <small>${escapeHtml(story.subtitle)}</small>
+      </span>
+      <span class="attack-story-score">${story.score}</span>
+      <span class="attack-story-flow">
+        ${story.stages.map((stage) => attackStoryStageHtml(stage)).join("")}
+      </span>
+    </button>
+  `;
+}
+
+function attackStoryStageHtml(stage) {
+  const count = stage.items.reduce((sum, item) => sum + Math.max(1, item.resourceIds?.length || 0), 0);
+  const severity = stage.items.reduce((current, item) => maxSeverityName(current, item.severity || "none"), "none");
+  const label = stage.items[0]?.label || "none";
+  return `
+    <span class="attack-story-stage severity-${escapeHtml(severity)}">
+      <small>${escapeHtml(stage.label)}</small>
+      <b>${escapeHtml(shortText(label, 22))}</b>
+      <em>${count ? escapeHtml(String(count)) : ""}</em>
+    </span>
+  `;
 }
 
 function ensureAttackNode(nodes, next) {
@@ -1905,7 +2085,32 @@ function addAttackLink(links, source, target, next) {
 }
 
 function publicIngressRules(finding) {
-  return Array.isArray(finding.attributes?.public_ingress) ? finding.attributes.public_ingress : [];
+  const rules = [];
+  if (Array.isArray(finding.attributes?.public_ingress)) {
+    rules.push(...finding.attributes.public_ingress);
+  }
+  if (finding.finding_type === "public_ingress" && Array.isArray(finding.attributes?.rules)) {
+    for (const rule of finding.attributes.rules) {
+      if (!rule.host && !rule.http) continue;
+      const host = rule.host || "public";
+      const paths = rule.http?.paths || [];
+      if (!paths.length) {
+        rules.push({ host, path: "/", protocol: "http", source: "public" });
+        continue;
+      }
+      for (const path of paths) {
+        rules.push({
+          host,
+          path: path.path || "/",
+          protocol: "http",
+          backend_service: path.backend?.service?.name || path.backend?.serviceName || "",
+          port: path.backend?.service?.port?.number || path.backend?.service?.port?.name || path.backend?.servicePort || "",
+          source: "public",
+        });
+      }
+    }
+  }
+  return rules;
 }
 
 function publicSourceLabels(rule) {
@@ -1916,6 +2121,10 @@ function publicSourceLabels(rule) {
 }
 
 function publicPortLabel(rule) {
+  if (rule.host || rule.path || rule.backend_service || rule.port) {
+    const backend = rule.backend_service ? `${rule.backend_service}${rule.port ? `:${rule.port}` : ""}` : "";
+    return [rule.host, rule.path, backend].filter(Boolean).join(" ");
+  }
   const protocol = rule.ip_protocol || rule.protocol || "tcp";
   const from = rule.from_port ?? rule.fromPort ?? "";
   const to = rule.to_port ?? rule.toPort ?? "";
@@ -2080,6 +2289,7 @@ function attackLinkPath(source, target) {
 
 function selectAttackNode(node) {
   state.attackSelection = node.id;
+  state.attackStoryKey = null;
   state.atlasSelection = null;
   state.selectedFinding = node.findings.length === 1 ? node.findings[0] : null;
   state.selectedNodeId = node.resourceIds[0] || null;
@@ -2088,6 +2298,38 @@ function selectAttackNode(node) {
   showAttackSelection(node);
   if (state.focusMode === "blast") applyFilters();
   else renderCurrentView();
+}
+
+function selectAttackStory(story, options = {}) {
+  if (!story) return;
+  state.attackStoryKey = story.key;
+  state.attackSelection = story.key;
+  state.atlasSelection = null;
+  state.selectedFinding = story.finding;
+  state.selectedNodeId = story.entry?.id || story.resourceIds[0] || null;
+  state.selection = { type: "attack-story", data: story };
+  selectGraphNodesByIds(story.resourceIds);
+  showAttackStorySelection(story);
+  if (state.focusMode === "blast") applyFilters();
+  else if (options.render !== false) renderCurrentView();
+}
+
+function showAttackStorySelection(story) {
+  $("#selection").className = "";
+  $("#selection").innerHTML = `
+    <div class="selected-title">${escapeHtml(story.title)}</div>
+    <div class="selected-meta">${escapeHtml(story.subtitle)}</div>
+    <div class="kv">
+      ${kv("severity", story.maxSeverity)}
+      ${kv("routes", story.routeKeys.length)}
+      ${kv("targets", story.targetIds.length)}
+      ${kv("blast", story.downstreamIds.length)}
+      ${kv("findings", story.relatedFindings.length)}
+      ${kv("entry", story.entry?.id || "n/a", story.entry?.id || null)}
+    </div>
+    ${objectList("Blast resources", story.resourceIds.slice(0, 16).map((uid) => nodeById(uid)?.label || uid))}
+    ${jsonDetails("Findings", story.relatedFindings.slice(0, 10).map(compactFinding))}
+  `;
 }
 
 function showAttackSelection(node) {
@@ -2228,6 +2470,7 @@ function renderGroupLanes() {
       state.selectedNodeId = null;
       state.atlasSelection = null;
       state.attackSelection = null;
+      state.attackStoryKey = null;
       selectGraphNodesByIds(group.nodeIds);
       showGroupSelection(group);
     });
@@ -2782,6 +3025,7 @@ function selectCostRow(row) {
   state.selectedNodeId = row.id;
   state.atlasSelection = null;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   selectGraphNodesByIds([row.id]);
   showNode(row.node);
 }
@@ -2792,6 +3036,7 @@ function selectCostGroup(group, model) {
   state.selectedNodeId = null;
   state.atlasSelection = null;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   selectGraphNodesByIds(group.nodeIds);
   showCostGroupSelection(group, model);
 }
@@ -3007,6 +3252,7 @@ function bindFindingViewRows(container, findings) {
 function selectFinding(finding) {
   state.atlasSelection = null;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   showFinding(finding);
   if (finding.aws_uid && state.cy) {
     const node = state.cy.getElementById(finding.aws_uid);
@@ -3258,11 +3504,26 @@ function nodeById(uid) {
   return graphNodeData().find((node) => node.id === uid);
 }
 
+function derivedBlastIdsForFinding(finding) {
+  const nodeIndex = new Map(graphNodeData().map((node) => [node.id, node]));
+  const story = attackStoryFromFinding(finding, nodeIndex);
+  return story?.resourceIds || [];
+}
+
 function computeBlastNodeIds() {
   const ids = new Set();
+  if (state.selection?.type === "attack-story") {
+    for (const uid of state.selection.data.resourceIds || []) ids.add(uid);
+    return ids;
+  }
+  if (state.selection?.type === "attack") {
+    for (const uid of state.selection.data.resourceIds || []) ids.add(uid);
+    return ids;
+  }
   if (state.selectedFinding) {
     if (state.selectedFinding.aws_uid) ids.add(state.selectedFinding.aws_uid);
     for (const uid of state.selectedFinding.blast_radius || []) ids.add(uid);
+    for (const uid of derivedBlastIdsForFinding(state.selectedFinding)) ids.add(uid);
     return ids;
   }
   if (state.selectedNodeId && state.cy) {
@@ -3453,6 +3714,7 @@ function clearSelection() {
   state.selectedNodeId = null;
   state.atlasSelection = null;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   if (state.cy) state.cy.elements().unselect();
   showEmptySelection();
   if (state.focusMode === "blast") applyFilters();
@@ -3465,6 +3727,7 @@ function showNode(data) {
   state.selectedFinding = null;
   state.atlasSelection = null;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   $("#selection").className = "";
   $("#selection").innerHTML = `
     <div class="selected-title">${escapeHtml(data.label)}</div>
@@ -3501,6 +3764,7 @@ function showEdge(data) {
   state.selectedNodeId = null;
   state.atlasSelection = null;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   $("#selection").className = "";
   $("#selection").innerHTML = `
     <div class="selected-title">${escapeHtml(data.relationshipType)}</div>
@@ -3522,6 +3786,7 @@ function showFinding(finding) {
   state.selectedNodeId = finding.aws_uid || null;
   state.atlasSelection = null;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   $("#selection").className = "";
   $("#selection").innerHTML = `
     <span class="severity-dot large ${escapeHtml(finding.severity)}" title="${escapeHtml(finding.severity)}" aria-label="${escapeHtml(finding.severity)}"></span>
@@ -3959,6 +4224,10 @@ function restoreSelection(selection) {
   } else if (selection.type === "attack") {
     selectGraphNodesByIds(selection.data.resourceIds || []);
     showAttackSelection(selection.data);
+  } else if (selection.type === "attack-story") {
+    state.attackStoryKey = selection.data.key;
+    selectGraphNodesByIds(selection.data.resourceIds || []);
+    showAttackStorySelection(selection.data);
   } else if (selection.type === "group") {
     selectGraphNodesByIds(selection.data.nodeIds || []);
     showGroupSelection(selection.data);
@@ -4044,9 +4313,15 @@ function spreadFocusIds() {
   const ids = new Set();
   if (!state.cy) return ids;
 
+  if (state.selection?.type === "attack-story" || state.selection?.type === "attack") {
+    for (const uid of state.selection.data.resourceIds || []) ids.add(uid);
+    return ids;
+  }
+
   if (state.selectedFinding) {
     if (state.selectedFinding.aws_uid) ids.add(state.selectedFinding.aws_uid);
     for (const uid of state.selectedFinding.blast_radius || []) ids.add(uid);
+    for (const uid of derivedBlastIdsForFinding(state.selectedFinding)) ids.add(uid);
     return ids;
   }
 
@@ -4092,6 +4367,7 @@ function resetView() {
   state.spreadMode = false;
   state.atlasSelection = null;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   clearSelection();
   syncControlsFromState();
   syncSpreadControl();
@@ -4607,6 +4883,7 @@ function defaultFilters() {
 function applyChipFilter(dataset) {
   state.atlasSelection = null;
   state.attackSelection = null;
+  state.attackStoryKey = null;
   if (dataset.filterSeverity) state.filters.severity = dataset.filterSeverity;
   if (dataset.filterService) state.filters.service = dataset.filterService;
   if (dataset.filterProvider) state.filters.provider = dataset.filterProvider;
